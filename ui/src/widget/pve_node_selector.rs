@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
 use anyhow::Error;
-use proxmox_yew_comp::{Status, rrd_value_renderer};
+use proxmox_yew_comp::rrd_value_renderer;
 use yew::{
     AttrValue, Callback, Component, Properties, html,
     html::{IntoEventCallback, IntoPropValue},
@@ -9,13 +9,12 @@ use yew::{
 };
 
 use pwt::{
-    AsyncPool,
     css::FlexFit,
-    props::{ContainerBuilder, FieldBuilder, WidgetBuilder, WidgetStyleBuilder},
+    props::{FieldBuilder, LoadCallback, WidgetBuilder, WidgetStyleBuilder},
     state::Store,
     tr,
     widget::{
-        Fa, GridPicker, Row,
+        GridPicker,
         data_table::{DataTable, DataTableColumn, DataTableHeader},
         form::{Selector, SelectorRenderArgs},
     },
@@ -75,89 +74,72 @@ impl PveNodeSelector {
     }
 }
 
-pub enum Msg {
-    UpdateNodeList(Result<Vec<ClusterNodeIndexResponse>, Error>),
-}
-
 pub struct PveNodeSelectorComp {
-    _async_pool: AsyncPool,
     store: Store<ClusterNodeIndexResponse>,
-    /// Unfiltered node list as fetched from the remote, kept so a prop change to `excluded_nodes`
-    /// can re-filter without round-tripping the remote again.
-    raw_nodes: Vec<ClusterNodeIndexResponse>,
-    last_err: Option<AttrValue>,
+    load_callback: LoadCallback<Vec<ClusterNodeIndexResponse>>,
 }
 
 impl PveNodeSelectorComp {
-    async fn get_node_list(remote: AttrValue) -> Result<Vec<ClusterNodeIndexResponse>, Error> {
+    async fn get_node_list(
+        remote: AttrValue,
+        excluded: Rc<Vec<String>>,
+        source_node: Option<AttrValue>,
+    ) -> Result<Vec<ClusterNodeIndexResponse>, Error> {
+        // An empty remote is a valid "no data yet" state for dependent selectors.
+        if remote.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let source_node = source_node.as_deref().map(str::to_string);
         let mut nodes = crate::pdm_client().pve_list_nodes(&remote).await?;
+        nodes.retain(|node| {
+            !excluded.iter().any(|excluded| excluded == &node.node)
+                && source_node.as_deref() != Some(node.node.as_str())
+        });
         nodes.sort_by(|a, b| a.node.cmp(&b.node));
         Ok(nodes)
     }
 
-    fn apply_filter(&mut self, excluded: &[String], source_node: Option<&str>) {
-        let filtered: Vec<ClusterNodeIndexResponse> = self
-            .raw_nodes
-            .iter()
-            .filter(|n| {
-                !excluded.iter().any(|e| e == &n.node) && source_node != Some(n.node.as_str())
-            })
-            .cloned()
-            .collect();
-        self.store.set_data(filtered);
+    fn create_load_callback(
+        ctx: &yew::Context<Self>,
+    ) -> LoadCallback<Vec<ClusterNodeIndexResponse>> {
+        let props = ctx.props();
+        let remote = props.remote.clone();
+        let excluded = props.excluded_nodes.clone();
+        let source_node = props.source_node.clone();
+
+        // The selector owns the loading lifecycle. Rebuilding this callback on dependent prop
+        // changes avoids stale node lists in forms that first select a remote, then a node.
+        (move || Self::get_node_list(remote.clone(), excluded.clone(), source_node.clone())).into()
     }
 }
 
 impl Component for PveNodeSelectorComp {
-    type Message = Msg;
+    type Message = ();
     type Properties = PveNodeSelector;
 
     fn create(ctx: &yew::Context<Self>) -> Self {
-        let _async_pool = AsyncPool::new();
-        let remote = ctx.props().remote.clone();
-        _async_pool.send_future(ctx.link().clone(), async move {
-            Msg::UpdateNodeList(Self::get_node_list(remote).await)
-        });
         Self {
-            _async_pool,
-            last_err: None,
-            raw_nodes: Vec::new(),
             store: Store::with_extract_key(|node: &ClusterNodeIndexResponse| {
                 Key::from(node.node.as_str())
             }),
+            load_callback: Self::create_load_callback(ctx),
         }
-    }
-
-    fn update(&mut self, ctx: &yew::Context<Self>, msg: Self::Message) -> bool {
-        match msg {
-            Msg::UpdateNodeList(res) => match res {
-                Ok(result) => {
-                    self.raw_nodes = result;
-                    self.apply_filter(
-                        &ctx.props().excluded_nodes,
-                        ctx.props().source_node.as_deref(),
-                    );
-                }
-                Err(err) => self.last_err = Some(err.to_string().into()),
-            },
-        }
-
-        true
     }
 
     fn changed(&mut self, ctx: &yew::Context<Self>, old_props: &Self::Properties) -> bool {
         let props = ctx.props();
-        if old_props.excluded_nodes != props.excluded_nodes
+        if old_props.remote != props.remote
+            || old_props.excluded_nodes != props.excluded_nodes
             || old_props.source_node != props.source_node
         {
-            self.apply_filter(&props.excluded_nodes, props.source_node.as_deref());
+            self.load_callback = Self::create_load_callback(ctx);
         }
         true
     }
 
     fn view(&self, ctx: &yew::Context<Self>) -> yew::Html {
         let props = ctx.props();
-        let err = self.last_err.clone();
         let show_memory = props.show_memory;
         let source_node = props.source_node.clone();
         let on_change = {
@@ -176,12 +158,6 @@ impl Component for PveNodeSelectorComp {
         };
         Selector::new(self.store.clone(), {
             move |args: &SelectorRenderArgs<Store<ClusterNodeIndexResponse>>| {
-                if let Some(err) = &err {
-                    return Row::new()
-                        .with_child(Fa::from(Status::Error))
-                        .with_child(err)
-                        .into();
-                }
                 GridPicker::new(
                     DataTable::new(columns(show_memory), args.store.clone())
                         .min_width(300)
@@ -193,6 +169,7 @@ impl Component for PveNodeSelectorComp {
                 .into()
             }
         })
+        .loader(self.load_callback.clone())
         .with_std_props(&props.std_props)
         .with_input_props(&props.input_props)
         .autoselect(source_node.is_none())

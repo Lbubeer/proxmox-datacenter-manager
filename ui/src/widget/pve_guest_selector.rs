@@ -21,8 +21,6 @@ use pwt::{
 };
 use pwt_macros::{builder, widget};
 
-use pdm_api_types::resource::PveResource;
-
 #[derive(Clone, PartialEq)]
 struct PveGuestEntry {
     vmid: u32,
@@ -94,45 +92,30 @@ impl PveGuestSelectorComp {
             guest_type.to_lowercase()
         };
 
+        let node_arg = node_filter.as_deref();
         let mut guests = Vec::new();
-        for resource in crate::pdm_client()
-            .pve_cluster_resources(&remote, None)
-            .await?
-        {
-            match resource {
-                PveResource::Qemu(item) if filter_guest_type != "lxc" => {
-                    if node_filter
-                        .as_ref()
-                        .map(|node| node != &item.node)
-                        .unwrap_or(false)
-                    {
-                        continue;
-                    }
-                    guests.push(PveGuestEntry {
-                        vmid: item.vmid,
-                        name: item.name,
-                        node: item.node,
-                        status: item.status,
-                        guest_type: "qemu".to_string(),
-                    });
-                }
-                PveResource::Lxc(item) if filter_guest_type == "lxc" => {
-                    if node_filter
-                        .as_ref()
-                        .map(|node| node != &item.node)
-                        .unwrap_or(false)
-                    {
-                        continue;
-                    }
-                    guests.push(PveGuestEntry {
-                        vmid: item.vmid,
-                        name: item.name,
-                        node: item.node,
-                        status: item.status,
-                        guest_type: "lxc".to_string(),
-                    });
-                }
-                _ => {}
+
+        let node_text = node_filter.clone().unwrap_or_else(|| "-".to_string());
+
+        if filter_guest_type == "lxc" {
+            for item in crate::pdm_client().pve_list_lxc(&remote, node_arg).await? {
+                guests.push(PveGuestEntry {
+                    vmid: item.vmid,
+                    name: item.name.unwrap_or_else(|| "-".to_string()),
+                    node: node_text.clone(),
+                    status: item.status.to_string(),
+                    guest_type: "lxc".to_string(),
+                });
+            }
+        } else {
+            for item in crate::pdm_client().pve_list_qemu(&remote, node_arg).await? {
+                guests.push(PveGuestEntry {
+                    vmid: item.vmid,
+                    name: item.name.unwrap_or_else(|| "-".to_string()),
+                    node: node_text.clone(),
+                    status: item.status.to_string(),
+                    guest_type: "qemu".to_string(),
+                });
             }
         }
 

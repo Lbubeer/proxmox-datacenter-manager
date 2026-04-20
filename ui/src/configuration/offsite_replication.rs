@@ -18,8 +18,8 @@ use pwt::state::{Selection, Store};
 use pwt::widget::data_table::{DataTable, DataTableColumn, DataTableHeader};
 use pwt::widget::form::{Checkbox, Combobox, DisplayField, Field, FormContext};
 use pwt::widget::{
-    Button, Column, ConfirmDialog, Container, Dialog, Fa, InputPanel, List, ListTile, Panel, Row,
-    TabBarItem, TabPanel, Toolbar, Trigger,
+    Button, ButtonType, Column, ConfirmDialog, Container, Dialog, Fa, InputPanel, List, ListTile,
+    Panel, Row, TabBarItem, TabPanel, Toolbar, Trigger,
 };
 
 use proxmox_schema::IntegerSchema;
@@ -36,15 +36,18 @@ use pdm_api_types::remotes::RemoteType;
 use pdm_api_types::resource::GuestType;
 use pdm_api_types::{
     OffsiteFailoverRequest, OffsiteRecoveryPoint, OffsiteReplicationJob,
-    OffsiteReplicationJobStatus, OffsiteReplicationRun, OFFSITE_REPLICATION_HISTORY_LIMIT_SCHEMA,
-    OFFSITE_REPLICATION_ID_SCHEMA, OFFSITE_REPLICATION_MAXSNAP_SCHEMA,
-    OFFSITE_REPLICATION_SCHEDULE_SCHEMA,
+    OffsiteReplicationJobStatus, OffsiteReplicationRun, OffsiteSshKeygenRequest,
+    OffsiteSshKeygenResult, OffsiteSshPrepareRequest, OffsiteSshPrepareResult,
+    OffsiteZfsStreamMode, OFFSITE_REPLICATION_HISTORY_LIMIT_SCHEMA, OFFSITE_REPLICATION_ID_SCHEMA,
+    OFFSITE_REPLICATION_MAXSNAP_SCHEMA, OFFSITE_REPLICATION_SCHEDULE_SCHEMA,
 };
 
 use crate::renderer::status_row;
 use crate::widget::{PveGuestSelector, PveNodeSelector, RemoteSelector};
 
 const BASE_URL: &str = "/config/offsite-replication";
+const SSH_PREPARE_URL: &str = "/config/offsite-replication-ssh-prepare";
+const SSH_KEYGEN_URL: &str = "/config/offsite-replication-ssh-keygen";
 const FAILOVER_VMID_OFFSET: u32 = 400;
 const TAB_JOBS: &str = "jobs";
 const TAB_METRICS: &str = "metrics";
@@ -56,9 +59,11 @@ const DEFAULT_JOB_SCHEDULE: &str = "*:0/5";
 const DEFAULT_MAX_SNAPSHOTS: &str = "4";
 const DEFAULT_HISTORY_LIMIT: &str = "200";
 const DEFAULT_TARGET_DATASET: &str = "offsite/replica";
+const DEFAULT_ZFS_STREAM_MODE: &str = "auto";
 const DEFAULT_SOURCE_USER: &str = "root";
 const DEFAULT_TARGET_USER: &str = "root";
 const DEFAULT_SSH_PRIVATE_KEY: &str = "/root/.ssh/pdm-offsite";
+const SSH_STEP_CODE_MISSING_PRIVATE_KEY: &str = "missing_private_key";
 const RATE_LIMIT_MIB_SCHEMA: proxmox_schema::Schema =
     IntegerSchema::new("Bandwidth limit (MiB/s).")
         .minimum(1)
@@ -86,6 +91,7 @@ pub enum ViewState {
     Create,
     Edit,
     Remove,
+    DeleteRecoverySnapshot,
     PickHistoryJob,
     PickFailoverJob,
     PickRunNowJob,
@@ -99,6 +105,8 @@ enum JobPickerTarget {
 }
 
 pub enum Msg {
+    OpenCreate,
+    OpenEdit,
     LoadFinished(Vec<OffsiteReplicationJobStatus>),
     MainTabChanged,
     Remove(Key, bool),
@@ -109,6 +117,14 @@ pub enum Msg {
     RunNowFinished(String, Result<String, Error>),
     OpenRunNowTaskLog,
     DismissRunNowFeedback,
+    PrepareSsh(Value),
+    PrepareSshFinished(Result<OffsiteSshPrepareResult, Error>),
+    GenerateSshKey(Value),
+    GenerateSshKeyFinished(
+        OffsiteSshPrepareRequest,
+        Result<OffsiteSshKeygenResult, Error>,
+    ),
+    OpenPrepareSshDetails,
     OpenHistory(Key),
     OpenFailover(Key),
     HistoryLoaded(String, usize, Result<Vec<OffsiteReplicationRun>, Error>),
@@ -116,6 +132,9 @@ pub enum Msg {
     RequestFailover(bool),
     TriggerFailover(String, OffsiteFailoverRequest),
     FailoverFinished(Result<String, Error>),
+    OpenDeleteRecoverySnapshot,
+    DeleteRecoverySnapshot(String),
+    DeleteRecoverySnapshotFinished(String, String, Result<(), Error>),
     UpdateFailoverSnapshot(String),
     UpdateFailoverVmid(String),
     UpdateFailoverName(String),
@@ -213,6 +232,7 @@ pub struct OffsiteReplicationPanelComp {
     recovery_points_loading: bool,
     recovery_points: Vec<OffsiteRecoveryPoint>,
     recovery_store: Store<OffsiteRecoveryPoint>,
+    recovery_selection: Selection,
     recovery_filter_text: String,
     recovery_filter_mode: String,
     recovery_filter_recoverable: String,
@@ -225,12 +245,22 @@ pub struct OffsiteReplicationPanelComp {
     failover_start_guest: bool,
     failover_running: bool,
     failover_last_task: Option<String>,
+    recovery_delete_running: bool,
+    recovery_delete_candidate: Option<String>,
     job_picker_filter_text: String,
     job_picker_store: Store<OffsiteReplicationJobStatus>,
     job_picker_selection: Selection,
     job_picker_columns: Rc<Vec<DataTableHeader<OffsiteReplicationJobStatus>>>,
     remove_purge_target_snapshots: bool,
     auto_refresh_timer: Option<Timeout>,
+    ssh_prepare_running: bool,
+    ssh_prepare_result: Option<OffsiteSshPrepareResult>,
+    ssh_prepare_error: Option<String>,
+    ssh_prepare_details_expanded: bool,
+    ssh_prepare_last_details: String,
+    ssh_keygen_running: bool,
+    ssh_keygen_error: Option<String>,
+    ssh_keygen_overwrite_armed: bool,
 }
 
 pwt::impl_deref_mut_property!(
@@ -282,6 +312,12 @@ impl OffsiteReplicationPanelComp {
             DataTableColumn::new(tr!("Schedule"))
                 .width("120px")
                 .get_property(|item: &OffsiteReplicationJobStatus| item.job.schedule.as_str())
+                .into(),
+            DataTableColumn::new(tr!("Stream"))
+                .width("90px")
+                .render(|item: &OffsiteReplicationJobStatus| {
+                    zfs_stream_mode_text(item.job.zfs_stream_mode).into()
+                })
                 .into(),
             DataTableColumn::new(tr!("Last Success"))
                 .width("140px")
@@ -387,6 +423,12 @@ impl OffsiteReplicationPanelComp {
             DataTableColumn::new(tr!("Schedule"))
                 .width("120px")
                 .get_property(|item: &OffsiteReplicationJobStatus| item.job.schedule.as_str())
+                .into(),
+            DataTableColumn::new(tr!("Stream"))
+                .width("90px")
+                .render(|item: &OffsiteReplicationJobStatus| {
+                    zfs_stream_mode_text(item.job.zfs_stream_mode).into()
+                })
                 .into(),
             DataTableColumn::new(tr!("Status"))
                 .flex(2)
@@ -866,6 +908,11 @@ impl OffsiteReplicationPanelComp {
         self.history_store.read().lookup_record(&key).cloned()
     }
 
+    fn selected_recovery_point(&self) -> Option<OffsiteRecoveryPoint> {
+        let key = self.recovery_selection.selected_key()?;
+        self.recovery_store.read().lookup_record(&key).cloned()
+    }
+
     fn selected_failover_job(&self) -> Option<OffsiteReplicationJobStatus> {
         let id = self.failover_job_id.as_ref()?;
         self.store.read().lookup_record(&id.clone().into()).cloned()
@@ -941,8 +988,35 @@ impl OffsiteReplicationPanelComp {
     }
 
     fn create_add_dialog(&self, ctx: &LoadableComponentContext<Self>) -> Html {
+        let on_prepare = ctx.link().callback(Msg::PrepareSsh);
+        let on_generate_key = ctx.link().callback(Msg::GenerateSshKey);
+        let on_prepare_details = ctx.link().callback(|_| Msg::OpenPrepareSshDetails);
+        let prepare_running = self.ssh_prepare_running;
+        let prepare_result = self.ssh_prepare_result.clone();
+        let prepare_error = self.ssh_prepare_error.clone();
+        let prepare_details_expanded = self.ssh_prepare_details_expanded;
+        let prepare_last_details = self.ssh_prepare_last_details.clone();
+        let keygen_running = self.ssh_keygen_running;
+        let keygen_error = self.ssh_keygen_error.clone();
+        let keygen_overwrite_armed = self.ssh_keygen_overwrite_armed;
         EditWindow::new(tr!("Add") + ": " + &tr!("Off-site Replication Job"))
-            .renderer(|form_ctx| input_panel(form_ctx, InputPanelMode::Create))
+            .renderer(move |form_ctx| {
+                input_panel(
+                    form_ctx,
+                    InputPanelMode::Create,
+                    Some(on_prepare.clone()),
+                    Some(on_generate_key.clone()),
+                    Some(on_prepare_details.clone()),
+                    prepare_running,
+                    prepare_result.clone(),
+                    prepare_error.clone(),
+                    prepare_details_expanded,
+                    prepare_last_details.clone(),
+                    keygen_running,
+                    keygen_error.clone(),
+                    keygen_overwrite_armed,
+                )
+            })
             .on_submit(create_job)
             .on_done(ctx.link().callback(|_| Msg::Reload))
             .into()
@@ -953,8 +1027,35 @@ impl OffsiteReplicationPanelComp {
         let edit_id = id.clone();
         let submit_id = id.clone();
         let path_id = percent_encode_component(&id);
+        let on_prepare = ctx.link().callback(Msg::PrepareSsh);
+        let on_generate_key = ctx.link().callback(Msg::GenerateSshKey);
+        let on_prepare_details = ctx.link().callback(|_| Msg::OpenPrepareSshDetails);
+        let prepare_running = self.ssh_prepare_running;
+        let prepare_result = self.ssh_prepare_result.clone();
+        let prepare_error = self.ssh_prepare_error.clone();
+        let prepare_details_expanded = self.ssh_prepare_details_expanded;
+        let prepare_last_details = self.ssh_prepare_last_details.clone();
+        let keygen_running = self.ssh_keygen_running;
+        let keygen_error = self.ssh_keygen_error.clone();
+        let keygen_overwrite_armed = self.ssh_keygen_overwrite_armed;
         EditWindow::new(tr!("Edit") + ": " + &tr!("Off-site Replication Job"))
-            .renderer(move |form_ctx| input_panel(form_ctx, InputPanelMode::Edit(edit_id.clone())))
+            .renderer(move |form_ctx| {
+                input_panel(
+                    form_ctx,
+                    InputPanelMode::Edit(edit_id.clone()),
+                    Some(on_prepare.clone()),
+                    Some(on_generate_key.clone()),
+                    Some(on_prepare_details.clone()),
+                    prepare_running,
+                    prepare_result.clone(),
+                    prepare_error.clone(),
+                    prepare_details_expanded,
+                    prepare_last_details.clone(),
+                    keygen_running,
+                    keygen_error.clone(),
+                    keygen_overwrite_armed,
+                )
+            })
             .loader(format!("{BASE_URL}/{path_id}"))
             .on_submit(move |form_ctx| update_job(submit_id.clone(), form_ctx))
             .on_done(ctx.link().callback(|_| Msg::Reload))
@@ -1064,6 +1165,10 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
             let link = ctx.link().clone();
             move |_| link.send_redraw()
         });
+        let recovery_selection = Selection::new().on_select({
+            let link = ctx.link().clone();
+            move |_| link.send_redraw()
+        });
         let job_picker_selection = Selection::new().on_select({
             let link = ctx.link().clone();
             move |_| link.send_redraw()
@@ -1107,6 +1212,7 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
             recovery_store: Store::with_extract_key(|item: &OffsiteRecoveryPoint| {
                 item.snapshot.clone().into()
             }),
+            recovery_selection,
             recovery_filter_text: String::new(),
             recovery_filter_mode: "all".to_string(),
             recovery_filter_recoverable: "all".to_string(),
@@ -1121,6 +1227,8 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
             failover_start_guest: false,
             failover_running: false,
             failover_last_task: None,
+            recovery_delete_running: false,
+            recovery_delete_candidate: None,
             job_picker_filter_text: String::new(),
             job_picker_store: Store::with_extract_key(|item: &OffsiteReplicationJobStatus| {
                 item.job.id.clone().into()
@@ -1129,6 +1237,14 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
             job_picker_columns: Self::job_picker_columns(),
             remove_purge_target_snapshots: false,
             auto_refresh_timer: None,
+            ssh_prepare_running: false,
+            ssh_prepare_result: None,
+            ssh_prepare_error: None,
+            ssh_prepare_details_expanded: false,
+            ssh_prepare_last_details: String::new(),
+            ssh_keygen_running: false,
+            ssh_keygen_error: None,
+            ssh_keygen_overwrite_armed: false,
         };
         ctx.link().send_message(Msg::ScheduleAutoRefresh);
         panel
@@ -1173,6 +1289,28 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                 }
             }
             Msg::ScheduleAutoRefresh => self.schedule_auto_refresh(ctx),
+            Msg::OpenCreate => {
+                self.ssh_prepare_running = false;
+                self.ssh_prepare_result = None;
+                self.ssh_prepare_error = None;
+                self.ssh_prepare_details_expanded = false;
+                self.ssh_prepare_last_details.clear();
+                self.ssh_keygen_running = false;
+                self.ssh_keygen_error = None;
+                self.ssh_keygen_overwrite_armed = false;
+                ctx.link().change_view(Some(ViewState::Create));
+            }
+            Msg::OpenEdit => {
+                self.ssh_prepare_running = false;
+                self.ssh_prepare_result = None;
+                self.ssh_prepare_error = None;
+                self.ssh_prepare_details_expanded = false;
+                self.ssh_prepare_last_details.clear();
+                self.ssh_keygen_running = false;
+                self.ssh_keygen_error = None;
+                self.ssh_keygen_overwrite_armed = false;
+                ctx.link().change_view(Some(ViewState::Edit));
+            }
             Msg::AutoRefreshTick => {
                 self.auto_refresh_timer = None;
                 if !self.loading()
@@ -1300,6 +1438,144 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
             Msg::DismissRunNowFeedback => {
                 self.run_now_feedback = None;
             }
+            Msg::PrepareSsh(form_data) => {
+                if self.ssh_prepare_running || self.ssh_keygen_running {
+                    return false;
+                }
+                let request = match parse_ssh_prepare_request(form_data) {
+                    Ok(request) => request,
+                    Err(err) => {
+                        self.ssh_prepare_result = None;
+                        self.ssh_prepare_error = Some(err.to_string());
+                        self.ssh_prepare_last_details =
+                            format!("{}:\n{}", tr!("Preparation request validation failed"), err);
+                        self.ssh_prepare_details_expanded = true;
+                        return true;
+                    }
+                };
+
+                self.ssh_prepare_running = true;
+                self.ssh_prepare_result = None;
+                self.ssh_prepare_error = None;
+                self.ssh_prepare_details_expanded = false;
+                self.ssh_prepare_last_details.clear();
+                self.ssh_keygen_error = None;
+                self.ssh_keygen_overwrite_armed = false;
+                let link = ctx.link().clone();
+                ctx.link().spawn(async move {
+                    let payload = serde_json::to_value(request).ok();
+                    let result = http_post(SSH_PREPARE_URL, payload).await;
+                    link.send_message(Msg::PrepareSshFinished(result));
+                });
+            }
+            Msg::PrepareSshFinished(result) => {
+                self.ssh_prepare_running = false;
+                match result {
+                    Ok(result) => {
+                        let missing_private_key = !result.ok
+                            && result.steps.iter().any(|step| {
+                                !step.ok
+                                    && step.code.as_deref()
+                                        == Some(SSH_STEP_CODE_MISSING_PRIVATE_KEY)
+                            });
+                        self.ssh_prepare_last_details = format_ssh_prepare_details(&result);
+                        self.ssh_prepare_details_expanded = !result.ok;
+                        self.ssh_prepare_error = None;
+                        if !missing_private_key {
+                            self.ssh_keygen_overwrite_armed = false;
+                        }
+                        self.ssh_prepare_result = Some(result);
+                    }
+                    Err(err) => {
+                        self.ssh_prepare_result = None;
+                        self.ssh_prepare_error = Some(err.to_string());
+                        self.ssh_prepare_last_details =
+                            format!("{}:\n{err}", tr!("Preparation request failed"));
+                        self.ssh_prepare_details_expanded = true;
+                    }
+                }
+            }
+            Msg::GenerateSshKey(form_data) => {
+                if self.ssh_keygen_running || self.ssh_prepare_running {
+                    return false;
+                }
+
+                let prepare_request = match parse_ssh_prepare_request(form_data) {
+                    Ok(request) => request,
+                    Err(err) => {
+                        self.ssh_keygen_error = Some(format!(
+                            "{}: {err}",
+                            tr!("Key generation request validation failed")
+                        ));
+                        return true;
+                    }
+                };
+                let keygen_request = OffsiteSshKeygenRequest {
+                    source_remote: prepare_request.source_remote.clone(),
+                    vmid: prepare_request.vmid,
+                    target_remote: prepare_request.target_remote.clone(),
+                    ssh_private_key: prepare_request.ssh_private_key.clone(),
+                    overwrite: self.ssh_keygen_overwrite_armed,
+                };
+                self.ssh_keygen_running = true;
+                self.ssh_keygen_error = None;
+                let link = ctx.link().clone();
+                ctx.link().spawn(async move {
+                    let payload = serde_json::to_value(keygen_request).ok();
+                    let result = http_post(SSH_KEYGEN_URL, payload).await;
+                    link.send_message(Msg::GenerateSshKeyFinished(prepare_request, result));
+                });
+            }
+            Msg::GenerateSshKeyFinished(prepare_request, result) => {
+                self.ssh_keygen_running = false;
+                match result {
+                    Ok(result) => {
+                        if result.ok {
+                            self.ssh_keygen_overwrite_armed = false;
+                            self.ssh_keygen_error = Some(format!(
+                                "{} {} ({})",
+                                tr!("SSH key prepared:"),
+                                result.message,
+                                result
+                                    .fingerprint
+                                    .clone()
+                                    .unwrap_or_else(|| tr!("fingerprint unavailable").to_string()),
+                            ));
+                            self.ssh_prepare_running = true;
+                            self.ssh_prepare_result = None;
+                            self.ssh_prepare_error = None;
+                            self.ssh_prepare_details_expanded = false;
+                            self.ssh_prepare_last_details.clear();
+                            let link = ctx.link().clone();
+                            ctx.link().spawn(async move {
+                                let payload = serde_json::to_value(prepare_request).ok();
+                                let result = http_post(SSH_PREPARE_URL, payload).await;
+                                link.send_message(Msg::PrepareSshFinished(result));
+                            });
+                        } else if result.status == "exists" {
+                            self.ssh_keygen_overwrite_armed = true;
+                            self.ssh_keygen_error = Some(format!(
+                                "{} {}",
+                                tr!("SSH key already exists."),
+                                tr!("Click 'Overwrite Key' to replace it."),
+                            ));
+                        } else {
+                            self.ssh_keygen_error = Some(result.message);
+                        }
+                    }
+                    Err(err) => {
+                        self.ssh_keygen_error = Some(format!(
+                            "{}: {err}",
+                            tr!("SSH key generation request failed")
+                        ));
+                    }
+                }
+            }
+            Msg::OpenPrepareSshDetails => {
+                if !self.ssh_prepare_last_details.trim().is_empty() {
+                    self.ssh_prepare_details_expanded = !self.ssh_prepare_details_expanded;
+                }
+            }
             Msg::OpenHistory(key) => {
                 let rec = {
                     let store = self.store.read();
@@ -1372,6 +1648,16 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                                 .map(|point| point.snapshot.clone())
                                 .unwrap_or_default();
                         }
+                        if let Some(current_key) = self.recovery_selection.selected_key() {
+                            let current = current_key.to_string();
+                            if !points.iter().any(|point| point.snapshot == current) {
+                                if let Some(first) = points.first() {
+                                    self.recovery_selection.select(first.snapshot.clone());
+                                }
+                            }
+                        } else if let Some(first) = points.first() {
+                            self.recovery_selection.select(first.snapshot.clone());
+                        }
                         self.recovery_store.set_data(points.clone());
                         self.recovery_points = points;
                         self.sync_recovery_view_store();
@@ -1427,6 +1713,67 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                     ctx.link().send_message(Msg::OpenFailover(id.into()));
                 }
                 ctx.link().send_reload();
+            }
+            Msg::OpenDeleteRecoverySnapshot => {
+                let Some(point) = self.selected_recovery_point() else {
+                    ctx.link().show_error(
+                        tr!("Delete snapshot"),
+                        tr!("Select a recovery snapshot first."),
+                        true,
+                    );
+                    return true;
+                };
+                self.recovery_delete_candidate = Some(point.snapshot);
+                ctx.link()
+                    .change_view(Some(ViewState::DeleteRecoverySnapshot));
+            }
+            Msg::DeleteRecoverySnapshot(snapshot) => {
+                let Some(job_id) = self
+                    .failover_job_id
+                    .clone()
+                    .or_else(|| self.history_job_id.clone())
+                else {
+                    ctx.link().show_error(
+                        tr!("Delete snapshot"),
+                        tr!("No off-site replication job is selected."),
+                        true,
+                    );
+                    return true;
+                };
+                self.recovery_delete_running = true;
+                self.recovery_delete_candidate = Some(snapshot.clone());
+                let link = ctx.link().clone();
+                ctx.link().spawn(async move {
+                    let path = format!(
+                        "{BASE_URL}/{}/recovery-snapshot",
+                        percent_encode_component(&job_id)
+                    );
+                    let result =
+                        http_delete(path, Some(serde_json::json!({ "snapshot": snapshot }))).await;
+                    link.send_message(Msg::DeleteRecoverySnapshotFinished(
+                        job_id, snapshot, result,
+                    ));
+                });
+            }
+            Msg::DeleteRecoverySnapshotFinished(job_id, snapshot, result) => {
+                self.recovery_delete_running = false;
+                self.recovery_delete_candidate = None;
+                ctx.link().change_view(None);
+                match result {
+                    Ok(()) => {
+                        if self.current_tab() == TAB_METRICS {
+                            let limit = self.requested_history_limit_for_job(&job_id);
+                            self.load_history_for_job_id(job_id.clone(), limit, true, ctx);
+                        } else {
+                            self.load_failover_for_job_id(job_id.clone(), ctx);
+                        }
+                    }
+                    Err(err) => ctx.link().show_error(
+                        tr!("Delete snapshot"),
+                        format!("{snapshot}: {err}"),
+                        true,
+                    ),
+                }
             }
             Msg::UpdateFailoverVmid(value) => self.failover_vmid_input = value,
             Msg::UpdateFailoverSnapshot(value) => self.failover_snapshot_input = value,
@@ -1614,13 +1961,13 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                 .with_child(
                     Button::new(tr!("Add"))
                         .icon_class("fa fa-plus-circle")
-                        .on_activate(ctx.link().change_view_callback(|_| Some(ViewState::Create))),
+                        .on_activate(ctx.link().callback(|_| Msg::OpenCreate)),
                 )
                 .with_child(
                     Button::new(tr!("Edit"))
                         .icon_class("fa fa-pencil")
                         .disabled(selected_key.is_none())
-                        .on_activate(ctx.link().change_view_callback(|_| Some(ViewState::Edit))),
+                        .on_activate(ctx.link().callback(|_| Msg::OpenEdit)),
                 )
                 .with_child(
                     Button::new(tr!("Remove"))
@@ -2287,6 +2634,20 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                                                     ctx.link().callback(|_| Msg::ToggleRecoveryFilters),
                                                 ),
                                         )
+                                        .with_child(
+                                            Button::new(tr!("Delete Snapshot"))
+                                                .icon_class("fa fa-trash")
+                                                .disabled(
+                                                    self.recovery_delete_running
+                                                        || self.recovery_points_loading
+                                                        || self.recovery_points.is_empty()
+                                                        || self.recovery_selection.is_empty(),
+                                                )
+                                                .on_activate(
+                                                    ctx.link()
+                                                        .callback(|_| Msg::OpenDeleteRecoverySnapshot),
+                                                ),
+                                        )
                                         .with_flex_spacer()
                                         .with_child(
                                             html! {<span style="opacity:0.75;">{format!("{}: {recovery_visible}/{}", tr!("Visible"), self.recovery_points.len())}</span>},
@@ -2343,7 +2704,8 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                                         self.recovery_columns.clone(),
                                         self.recovery_view_store.clone(),
                                     )
-                                        .class(pwt::css::FlexFit),
+                                        .class(pwt::css::FlexFit)
+                                        .selection(self.recovery_selection.clone()),
                                 ),
                         ),
                 )
@@ -2491,6 +2853,24 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                 dialog.set_confirm_message(content);
                 dialog.into()
             }),
+            ViewState::DeleteRecoverySnapshot => {
+                self.recovery_delete_candidate.clone().map(|snapshot| {
+                    let snapshot_for_confirm = snapshot.clone();
+                    let mut dialog = ConfirmDialog::default().on_confirm({
+                        let link = ctx.link().clone();
+                        move |_| link.send_message(Msg::DeleteRecoverySnapshot(snapshot.clone()))
+                    });
+                    dialog.set_confirm_message(format!(
+                        "{}\n{}",
+                        tr!(
+                            "Delete recoverable snapshot '{0}' from target storage?",
+                            snapshot_for_confirm
+                        ),
+                        tr!("This action cannot be undone.")
+                    ));
+                    dialog.into()
+                })
+            }
             ViewState::PickHistoryJob => Some(self.create_job_picker_dialog(
                 tr!("Select Job for Metrics / History"),
                 JobPickerTarget::History,
@@ -2521,7 +2901,108 @@ fn set_default_form_text(form_ctx: &FormContext, key: &'static str, default: &'s
     }
 }
 
-fn input_panel(form_ctx: &FormContext, mode: InputPanelMode) -> Html {
+fn format_ssh_prepare_details(result: &OffsiteSshPrepareResult) -> String {
+    let mut lines = vec![
+        format!("{}: {}", tr!("Source Host"), result.source_host),
+        format!("{}: {}", tr!("Target Host"), result.target_host),
+        String::new(),
+    ];
+
+    for step in &result.steps {
+        let status = if step.ok { "OK" } else { "ERROR" };
+        lines.push(format!("[{status}] {}: {}", step.name, step.message));
+        if let Some(remediation) = step.remediation.as_deref() {
+            lines.push(format!("  {}: {remediation}", tr!("Hint")));
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn render_ssh_prepare_feedback(
+    result: Option<OffsiteSshPrepareResult>,
+    error: Option<String>,
+    details_expanded: bool,
+    details_text: String,
+) -> Html {
+    if let Some(error) = error.as_deref() {
+        return html! {
+            <div style="padding-top: 6px; display: grid; gap: 4px;">
+                <div class="pwt-color-error">
+                    {format!("{}: {error}", tr!("Last error"))}
+                </div>
+                {if details_expanded && !details_text.trim().is_empty() {
+                    html! {
+                        <pre style="margin: 0; white-space: pre-wrap; word-break: break-word; font-family: monospace; font-size: 0.92em; border: 1px solid var(--pwt-color-border); padding: 8px; border-radius: 2px;">
+                            {details_text}
+                        </pre>
+                    }
+                } else {
+                    html! {}
+                }}
+            </div>
+        };
+    }
+
+    let Some(result) = result else {
+        return html! {};
+    };
+
+    let headline = if result.ok {
+        tr!("SSH preparation passed.")
+    } else {
+        tr!("SSH preparation found issues.")
+    };
+    let row_class = if result.ok {
+        "pwt-color-success"
+    } else {
+        "pwt-color-warning"
+    };
+    let failed_count = result.steps.iter().filter(|step| !step.ok).count();
+    let passed_count = result.steps.len().saturating_sub(failed_count);
+
+    html! {
+        <div style="padding-top: 6px; display: grid; gap: 4px;">
+            <div class={row_class}>{headline}</div>
+            <div style="opacity: 0.8;">
+                {format!("{}: {}  {}: {}", tr!("Source Host"), result.source_host, tr!("Target Host"), result.target_host)}
+            </div>
+            <div style="opacity: 0.85;">
+                {format!("{}: {passed_count}, {}: {failed_count}", tr!("Passed Steps"), tr!("Failed Steps"))}
+            </div>
+            {if failed_count > 0 {
+                html! {<div class="pwt-color-warning">{tr!("Use 'View Details' for full remediation steps.")}</div>}
+            } else {
+                html! {}
+            }}
+            {if details_expanded && !details_text.trim().is_empty() {
+                html! {
+                    <pre style="margin: 0; white-space: pre-wrap; word-break: break-word; font-family: monospace; font-size: 0.92em; border: 1px solid var(--pwt-color-border); padding: 8px; border-radius: 2px;">
+                        {details_text}
+                    </pre>
+                }
+            } else {
+                html! {}
+            }}
+        </div>
+    }
+}
+
+fn input_panel(
+    form_ctx: &FormContext,
+    mode: InputPanelMode,
+    on_prepare_ssh: Option<Callback<Value>>,
+    on_generate_ssh_key: Option<Callback<Value>>,
+    on_prepare_ssh_details: Option<Callback<()>>,
+    ssh_prepare_running: bool,
+    ssh_prepare_result: Option<OffsiteSshPrepareResult>,
+    ssh_prepare_error: Option<String>,
+    ssh_prepare_details_expanded: bool,
+    ssh_prepare_last_details: String,
+    ssh_keygen_running: bool,
+    ssh_keygen_error: Option<String>,
+    ssh_keygen_overwrite_armed: bool,
+) -> Html {
     let guest_types = Rc::new(vec!["qemu".into(), "lxc".into()]);
     let is_create = matches!(mode, InputPanelMode::Create);
 
@@ -2531,6 +3012,7 @@ fn input_panel(form_ctx: &FormContext, mode: InputPanelMode) -> Html {
         set_default_form_text(form_ctx, "schedule", DEFAULT_JOB_SCHEDULE);
         set_default_form_text(form_ctx, "max-snapshots", DEFAULT_MAX_SNAPSHOTS);
         set_default_form_text(form_ctx, "history-limit", DEFAULT_HISTORY_LIMIT);
+        set_default_form_text(form_ctx, "zfs-stream-mode", DEFAULT_ZFS_STREAM_MODE);
         set_default_form_text(form_ctx, "source-user", DEFAULT_SOURCE_USER);
         set_default_form_text(form_ctx, "target-user", DEFAULT_TARGET_USER);
         set_default_form_text(form_ctx, "ssh-private-key", DEFAULT_SSH_PRIVATE_KEY);
@@ -2540,11 +3022,14 @@ fn input_panel(form_ctx: &FormContext, mode: InputPanelMode) -> Html {
     let source_node = form_ctx.read().get_field_text("source-node");
     let guest_type = form_ctx.read().get_field_text("guest-type");
     let target_remote = form_ctx.read().get_field_text("target-remote");
+    let vmid_default = form_ctx.read().get_field_text("vmid");
     let show_advanced = if is_create {
         form_ctx.read().get_field_checked("show-advanced")
     } else {
         true
     };
+    let install_authorized_keys = form_ctx.read().get_field_checked("install-authorized-keys");
+    let copy_key_to_source = form_ctx.read().get_field_checked("copy-key-to-source");
 
     let source_remote_value: yew::AttrValue = source_remote.clone().into();
     let source_node_value = if source_node.trim().is_empty() {
@@ -2557,6 +3042,11 @@ fn input_panel(form_ctx: &FormContext, mode: InputPanelMode) -> Html {
         "qemu".into()
     } else {
         guest_type.clone().into()
+    };
+    let vmid_default_value: Option<yew::AttrValue> = if vmid_default.trim().is_empty() {
+        None
+    } else {
+        Some(vmid_default.into())
     };
 
     let mut panel = InputPanel::new().padding(4);
@@ -2574,22 +3064,66 @@ fn input_panel(form_ctx: &FormContext, mode: InputPanelMode) -> Html {
         }
     }
 
+    let source_remote_field = if is_create {
+        RemoteSelector::new()
+            .name("source-remote")
+            .remote_type(RemoteType::Pve)
+            .on_change({
+                let form_ctx = form_ctx.clone();
+                move |_| {
+                    let mut form = form_ctx.write();
+                    form.set_field_value("source-node", Value::Null);
+                    form.set_field_value("vmid", Value::Null);
+                }
+            })
+            .required(true)
+    } else {
+        RemoteSelector::new()
+            .name("source-remote")
+            .remote_type(RemoteType::Pve)
+            .required(true)
+    };
+
+    let guest_type_field = if is_create {
+        Combobox::new()
+            .name("guest-type")
+            .required(true)
+            .editable(false)
+            .items(guest_types.clone())
+            .on_change({
+                let form_ctx = form_ctx.clone();
+                move |_| {
+                    form_ctx.write().set_field_value("vmid", Value::Null);
+                }
+            })
+    } else {
+        Combobox::new()
+            .name("guest-type")
+            .required(true)
+            .editable(false)
+            .items(guest_types.clone())
+    };
+
+    let target_remote_field = if is_create {
+        RemoteSelector::new()
+            .name("target-remote")
+            .remote_type(RemoteType::Pve)
+            .on_change({
+                let form_ctx = form_ctx.clone();
+                move |_| {
+                    form_ctx.write().set_field_value("target-node", Value::Null);
+                }
+            })
+            .required(true)
+    } else {
+        RemoteSelector::new()
+            .name("target-remote")
+            .remote_type(RemoteType::Pve)
+            .required(true)
+    };
+
     panel = panel
-        .with_field(
-            tr!("Source Remote"),
-            RemoteSelector::new()
-                .name("source-remote")
-                .remote_type(RemoteType::Pve)
-                .on_change({
-                    let form_ctx = form_ctx.clone();
-                    move |_| {
-                        let mut form = form_ctx.write();
-                        form.set_field_value("source-node", Value::Null);
-                        form.set_field_value("vmid", Value::Null);
-                    }
-                })
-                .required(true),
-        )
+        .with_field(tr!("Source Remote"), source_remote_field)
         .with_field(
             tr!("Source Node"),
             PveNodeSelector::new(source_remote_value.clone())
@@ -2597,26 +3131,14 @@ fn input_panel(form_ctx: &FormContext, mode: InputPanelMode) -> Html {
                 .required(true)
                 .disabled(source_remote.trim().is_empty()),
         )
-        .with_field(
-            tr!("Guest Type"),
-            Combobox::new()
-                .name("guest-type")
-                .required(true)
-                .editable(false)
-                .items(guest_types)
-                .on_change({
-                    let form_ctx = form_ctx.clone();
-                    move |_| {
-                        form_ctx.write().set_field_value("vmid", Value::Null);
-                    }
-                }),
-        )
+        .with_field(tr!("Guest Type"), guest_type_field)
         .with_field(
             tr!("Source Guest (VMID)"),
             PveGuestSelector::new(source_remote_value)
                 .name("vmid")
                 .node(source_node_value)
                 .guest_type(guest_type_value)
+                .default(vmid_default_value)
                 .required(true)
                 .disabled(source_remote.trim().is_empty() || source_node.trim().is_empty())
                 .on_change({
@@ -2636,19 +3158,7 @@ fn input_panel(form_ctx: &FormContext, mode: InputPanelMode) -> Html {
                     }
                 }),
         )
-        .with_field(
-            tr!("Target Remote"),
-            RemoteSelector::new()
-                .name("target-remote")
-                .remote_type(RemoteType::Pve)
-                .on_change({
-                    let form_ctx = form_ctx.clone();
-                    move |_| {
-                        form_ctx.write().set_field_value("target-node", Value::Null);
-                    }
-                })
-                .required(true),
-        )
+        .with_field(tr!("Target Remote"), target_remote_field)
         .with_field(
             tr!("Target Node"),
             PveNodeSelector::new(target_remote_value)
@@ -2680,6 +3190,14 @@ fn input_panel(form_ctx: &FormContext, mode: InputPanelMode) -> Html {
                 .name("history-limit")
                 .schema(&OFFSITE_REPLICATION_HISTORY_LIMIT_SCHEMA)
                 .required(true),
+        )
+        .with_field(
+            tr!("ZFS Stream Mode"),
+            Combobox::new()
+                .name("zfs-stream-mode")
+                .required(true)
+                .editable(false)
+                .items(Rc::new(vec!["auto".into(), "plain".into(), "raw".into()])),
         );
 
     if is_create {
@@ -2695,6 +3213,70 @@ fn input_panel(form_ctx: &FormContext, mode: InputPanelMode) -> Html {
     }
 
     if show_advanced {
+        let prepare_missing_private_key = ssh_prepare_result
+            .as_ref()
+            .map(|result| {
+                !result.ok
+                    && result.steps.iter().any(|step| {
+                        !step.ok && step.code.as_deref() == Some(SSH_STEP_CODE_MISSING_PRIVATE_KEY)
+                    })
+            })
+            .unwrap_or(false);
+        let show_generate_key_button = prepare_missing_private_key || ssh_keygen_overwrite_armed;
+        let has_prepare_details = !ssh_prepare_last_details.trim().is_empty();
+        let prepare_button = {
+            let callback = on_prepare_ssh.clone();
+            let form_ctx = form_ctx.clone();
+            Button::new(if ssh_prepare_running {
+                tr!("Prepare SSH (Running...)")
+            } else {
+                tr!("Prepare SSH")
+            })
+            .icon_class("fa fa-key")
+            .button_type(ButtonType::Button)
+            .disabled(ssh_prepare_running || callback.is_none())
+            .on_activate(move |_| {
+                if let Some(callback) = callback.clone() {
+                    callback.emit(form_ctx.get_submit_data());
+                }
+            })
+        };
+        let generate_key_button = {
+            let callback = on_generate_ssh_key.clone();
+            let form_ctx = form_ctx.clone();
+            Button::new(if ssh_keygen_running {
+                tr!("Generate Key (Running...)")
+            } else if ssh_keygen_overwrite_armed {
+                tr!("Overwrite Key")
+            } else {
+                tr!("Generate Key")
+            })
+            .icon_class("fa fa-cog")
+            .button_type(ButtonType::Button)
+            .disabled(ssh_prepare_running || ssh_keygen_running || callback.is_none())
+            .on_activate(move |_| {
+                if let Some(callback) = callback.clone() {
+                    callback.emit(form_ctx.get_submit_data());
+                }
+            })
+        };
+        let view_details_button = {
+            let callback = on_prepare_ssh_details.clone();
+            Button::new(if ssh_prepare_details_expanded {
+                tr!("Hide Details")
+            } else {
+                tr!("View Details")
+            })
+            .icon_class("fa fa-list-alt")
+            .button_type(ButtonType::Button)
+            .disabled(callback.is_none() || !has_prepare_details)
+            .on_activate(move |_| {
+                if let Some(callback) = callback.clone() {
+                    callback.emit(());
+                }
+            })
+        };
+
         panel = panel
             .with_field(
                 tr!("Rate Limit (MiB/s)"),
@@ -2713,6 +3295,67 @@ fn input_panel(form_ctx: &FormContext, mode: InputPanelMode) -> Html {
             .with_field(
                 tr!("SSH Private Key"),
                 Field::new().name("ssh-private-key").required(true),
+            )
+            .with_large_custom_child(
+                Column::new()
+                    .key("ssh-setup-assistant")
+                    .gap(1)
+                    .with_child(
+                        Panel::new().border(true).with_child(
+                            Column::new()
+                                .padding(2)
+                                .gap(1)
+                                .with_child(
+                                    Container::new()
+                                        .class("pwt-font-title-small")
+                                        .with_child(tr!("SSH Setup Assistant")),
+                                )
+                                .with_child(
+                                    Checkbox::new()
+                                        .name("install-authorized-keys")
+                                        .default(true)
+                                        .checked(install_authorized_keys)
+                                        .box_label(tr!(
+                                            "Install/verify public key in authorized_keys on source and target."
+                                        )),
+                                )
+                                .with_child(
+                                    Checkbox::new()
+                                        .name("copy-key-to-source")
+                                        .default(false)
+                                        .checked(copy_key_to_source)
+                                        .box_label(tr!(
+                                            "Copy keypair to source host for source->target pve-zsync hop."
+                                        )),
+                                )
+                                .with_child(
+                                    Row::new()
+                                        .gap(2)
+                                        .with_child(prepare_button)
+                                        .with_optional_child(
+                                            show_generate_key_button.then_some(generate_key_button),
+                                        )
+                                        .with_child(view_details_button)
+                                        .with_flex_spacer(),
+                                )
+                                .with_optional_child(ssh_keygen_error.as_ref().map(|message| {
+                                    let class = if message.starts_with("SSH key prepared:") {
+                                        "pwt-color-success"
+                                    } else {
+                                        "pwt-color-warning"
+                                    };
+                                    html! {
+                                        <div class={class}>{message.clone()}</div>
+                                    }
+                                }))
+                                .with_child(render_ssh_prepare_feedback(
+                                    ssh_prepare_result,
+                                    ssh_prepare_error,
+                                    ssh_prepare_details_expanded,
+                                    ssh_prepare_last_details,
+                                )),
+                        ),
+                    )
             )
             .with_large_field(
                 tr!("QEMU Guest Agent Freeze"),
@@ -2779,6 +3422,7 @@ fn normalize_job_form_aliases(data: &mut Value) {
         ("max_snapshots", "max-snapshots"),
         ("history_limit", "history-limit"),
         ("rate_limit_mib", "rate-limit-mib"),
+        ("zfs_stream_mode", "zfs-stream-mode"),
         ("source_user", "source-user"),
         ("target_user", "target-user"),
         ("ssh_private_key", "ssh-private-key"),
@@ -2808,6 +3452,45 @@ fn ensure_job_form_bool(data: &mut Value, key: &str, default: bool) {
     }
 }
 
+fn parse_ssh_prepare_request(form_data: Value) -> Result<OffsiteSshPrepareRequest, Error> {
+    let mut data = delete_empty_values(&form_data, &[], true);
+    normalize_job_form_aliases(&mut data);
+
+    ensure_job_form_default(&mut data, "source-user", DEFAULT_SOURCE_USER);
+    ensure_job_form_default(&mut data, "target-user", DEFAULT_TARGET_USER);
+    ensure_job_form_default(&mut data, "ssh-private-key", DEFAULT_SSH_PRIVATE_KEY);
+    ensure_job_form_bool(&mut data, "install-authorized-keys", true);
+    ensure_job_form_bool(&mut data, "copy-key-to-source", false);
+
+    normalize_u32_field(&mut data, "vmid")?;
+    let mut request: OffsiteSshPrepareRequest = serde_json::from_value(data)?;
+
+    request.source_remote = request.source_remote.trim().to_string();
+    request.source_node = request.source_node.trim().to_string();
+    request.target_remote = request.target_remote.trim().to_string();
+    request.target_node = request.target_node.trim().to_string();
+    request.source_user = request.source_user.trim().to_string();
+    request.target_user = request.target_user.trim().to_string();
+    request.ssh_private_key = request.ssh_private_key.trim().to_string();
+
+    if request.source_remote.is_empty()
+        || request.source_node.is_empty()
+        || request.target_remote.is_empty()
+        || request.target_node.is_empty()
+    {
+        bail!("source remote/node and target remote/node are required");
+    }
+
+    if request.source_user.is_empty()
+        || request.target_user.is_empty()
+        || request.ssh_private_key.is_empty()
+    {
+        bail!("source user, target user and ssh private key are required");
+    }
+
+    Ok(request)
+}
+
 fn parse_job_form(
     form_ctx: FormContext,
     fallback_id: Option<&str>,
@@ -2820,6 +3503,7 @@ fn parse_job_form(
     ensure_job_form_default(&mut data, "max-snapshots", DEFAULT_MAX_SNAPSHOTS);
     ensure_job_form_default(&mut data, "history-limit", DEFAULT_HISTORY_LIMIT);
     ensure_job_form_default(&mut data, "target-dataset", DEFAULT_TARGET_DATASET);
+    ensure_job_form_default(&mut data, "zfs-stream-mode", DEFAULT_ZFS_STREAM_MODE);
     ensure_job_form_default(&mut data, "source-user", DEFAULT_SOURCE_USER);
     ensure_job_form_default(&mut data, "target-user", DEFAULT_TARGET_USER);
     ensure_job_form_default(&mut data, "ssh-private-key", DEFAULT_SSH_PRIVATE_KEY);
@@ -2888,9 +3572,15 @@ async fn create_job(form_ctx: FormContext) -> Result<(), Error> {
 async fn update_job(id: String, form_ctx: FormContext) -> Result<(), Error> {
     let job = parse_job_form(form_ctx, Some(id.as_str()))?;
     let path = format!("{BASE_URL}/{}", percent_encode_component(&id));
-    let mut payload = serde_json::to_value(job)?;
-    payload["id"] = Value::from(id);
-    http_put(path, Some(payload)).await
+    http_put(path, Some(serde_json::to_value(job)?)).await
+}
+
+fn zfs_stream_mode_text(mode: OffsiteZfsStreamMode) -> &'static str {
+    match mode {
+        OffsiteZfsStreamMode::Auto => "auto",
+        OffsiteZfsStreamMode::Plain => "plain",
+        OffsiteZfsStreamMode::Raw => "raw",
+    }
 }
 
 fn guest_type_text(guest_type: GuestType) -> &'static str {
@@ -2915,7 +3605,7 @@ fn status_text(item: &OffsiteReplicationJobStatus) -> String {
 
 fn job_matches_filter(item: &OffsiteReplicationJobStatus, filter: &str) -> bool {
     let haystack = format!(
-        "{} {} {} {} {} {} {} {} {}",
+        "{} {} {} {} {} {} {} {} {} {}",
         item.job.id,
         guest_type_text(item.job.guest_type),
         item.job.vmid,
@@ -2925,6 +3615,7 @@ fn job_matches_filter(item: &OffsiteReplicationJobStatus, filter: &str) -> bool 
         item.job.target_node,
         item.job.target_dataset,
         item.job.schedule,
+        zfs_stream_mode_text(item.job.zfs_stream_mode),
     )
     .to_ascii_lowercase();
 

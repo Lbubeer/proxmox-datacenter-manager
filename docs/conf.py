@@ -128,6 +128,7 @@ exclude_patterns = [
     'certificate-management.rst',
     'epilog.rst',
     'local-zfs.rst',
+    'offsite-replication.rst',
     'package-repositories.rst',
     'pdm-copyright.rst',
     'system-booting.rst',

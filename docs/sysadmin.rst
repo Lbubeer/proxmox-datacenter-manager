@@ -23,6 +23,8 @@ standard Debian documentation.
 
 .. include:: local-zfs.rst
 
+.. include:: offsite-replication.rst
+
 .. include:: system-booting.rst
 
 .. include:: certificate-management.rst
