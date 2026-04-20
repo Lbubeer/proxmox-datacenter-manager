@@ -7,6 +7,7 @@ pub mod ceph;
 pub mod certificate_config;
 pub mod domains;
 pub mod node;
+pub mod offsite_replication;
 pub mod remotes;
 pub mod setup;
 pub mod subscriptions;

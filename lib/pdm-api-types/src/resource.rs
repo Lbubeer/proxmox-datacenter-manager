@@ -875,9 +875,13 @@ pub struct TopEntities {
     pub node_memory: Vec<TopEntity>,
 }
 
-#[derive(PartialEq, Clone, Copy, Serialize, Deserialize)]
+#[api]
+#[derive(PartialEq, Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+/// The type of a guest resource.
 pub enum GuestType {
+    /// A QEMU virtual machine.
     Qemu,
+    /// An LXC container.
     Lxc,
 }

@@ -112,6 +112,9 @@ pub mod remote_updates;
 
 pub mod resource;
 
+mod replication;
+pub use replication::*;
+
 pub mod rrddata;
 
 pub mod subscription;
