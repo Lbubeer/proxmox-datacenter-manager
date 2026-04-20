@@ -17,6 +17,8 @@ pub mod subscription_assign;
 pub mod subscription_keys;
 pub mod subscription_panel;
 pub mod subscription_registry;
+pub mod offsite_replication;
+pub mod offsite_replication;
 
 pub mod views;
 

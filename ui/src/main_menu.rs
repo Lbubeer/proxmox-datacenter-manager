@@ -15,6 +15,7 @@ use pdm_api_types::remotes::RemoteType;
 use pdm_api_types::{PRIV_SYS_AUDIT, PRIV_SYS_MODIFY};
 
 use crate::ceph::CephView;
+use crate::configuration::offsite_replication::OffsiteReplicationPanel;
 use crate::configuration::subscription_panel::SubscriptionPanel;
 use crate::configuration::subscription_registry::SubscriptionRegistryProps;
 use crate::configuration::views::ViewGrid;
@@ -268,6 +269,21 @@ impl Component for PdmMainMenu {
             "certificates",
             Some("fa fa-certificate"),
             |_| html! {<CertificatesPanel/>},
+        );
+
+        register_view(
+            &mut config_submenu,
+            &mut content,
+            tr!("Off-site Replication"),
+            "offsite-replication",
+            Some("fa fa-database"),
+            |_| {
+                Panel::new()
+                    .class(css::FlexFit)
+                    .title(tr!("Off-site Replication"))
+                    .with_child(OffsiteReplicationPanel::new())
+                    .into()
+            },
         );
 
         register_view(
