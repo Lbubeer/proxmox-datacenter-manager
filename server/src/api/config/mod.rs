@@ -6,6 +6,7 @@ pub mod access;
 pub mod acme;
 pub mod certificate;
 pub mod notes;
+pub mod offsite_replication;
 pub mod views;
 
 #[sortable]
@@ -14,6 +15,7 @@ const SUBDIRS: SubdirMap = &sorted!([
     ("acme", &acme::ROUTER),
     ("certificate", &certificate::ROUTER),
     ("notes", &notes::ROUTER),
+    ("offsite-replication", &offsite_replication::ROUTER),
     ("views", &views::ROUTER)
 ]);
 
