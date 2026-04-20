@@ -7,7 +7,9 @@ use proxmox_sortable_macro::sortable;
 
 use pdm_api_types::{
     Authid, ConfigDigest, OffsiteFailoverRequest, OffsiteRecoveryPoint, OffsiteReplicationJob,
-    OffsiteReplicationJobStatus, OffsiteReplicationRun, OFFSITE_REPLICATION_HISTORY_LIMIT_SCHEMA,
+    OffsiteReplicationJobStatus, OffsiteReplicationJobUpdater, OffsiteReplicationRun,
+    OffsiteSshKeygenRequest, OffsiteSshKeygenResult, OffsiteSshPrepareRequest,
+    OffsiteSshPrepareResult, OFFSITE_REPLICATION_HISTORY_LIMIT_SCHEMA,
     OFFSITE_REPLICATION_ID_SCHEMA, PRIV_RESOURCE_AUDIT, PRIV_RESOURCE_MANAGE,
 };
 
@@ -22,11 +24,18 @@ const ITEM_SUBDIRS: SubdirMap = &sorted!([
     ("failover", &Router::new().post(&API_METHOD_FAILOVER)),
     ("history", &Router::new().get(&API_METHOD_LIST_HISTORY)),
     (
+        "recovery-snapshot",
+        &Router::new().delete(&API_METHOD_DELETE_RECOVERY_SNAPSHOT)
+    ),
+    (
         "recovery-points",
         &Router::new().get(&API_METHOD_LIST_RECOVERY_POINTS)
     ),
     ("run-now", &Router::new().post(&API_METHOD_RUN_NOW)),
 ]);
+
+pub const SSH_PREPARE_ROUTER: Router = Router::new().post(&API_METHOD_PREPARE_SSH);
+pub const SSH_KEYGEN_ROUTER: Router = Router::new().post(&API_METHOD_KEYGEN_SSH);
 
 pub const ROUTER: Router = Router::new()
     .get(&API_METHOD_LIST_JOBS)
@@ -42,7 +51,9 @@ fn validate_job(job: &OffsiteReplicationJob) -> Result<(), Error> {
         bail!("source and target remotes must differ");
     }
     if job.source_user != "root" {
-        bail!("source_user must be 'root' for guest replication jobs");
+        bail!(
+            "source_user must be 'root' for VMID-based replication (current pve-zsync backend requirement)"
+        );
     }
     if job.schedule.parse::<proxmox_time::CalendarEvent>().is_err() {
         bail!("invalid schedule '{}'", job.schedule);
@@ -61,20 +72,24 @@ fn check_source_guest_privs(
     job: &OffsiteReplicationJob,
     privilege: u64,
 ) -> Result<(), Error> {
+    check_source_guest_privs_for(rpcenv, &job.source_remote, job.vmid, privilege)
+}
+
+fn check_source_guest_privs_for(
+    rpcenv: &mut dyn RpcEnvironment,
+    source_remote: &str,
+    vmid: u32,
+    privilege: u64,
+) -> Result<(), Error> {
     let auth_id: Authid = rpcenv
         .get_auth_id()
         .ok_or_else(|| http_err!(UNAUTHORIZED, "missing auth id"))?
         .parse()?;
     let user_info = CachedUserInfo::new()?;
-    let vmid = job.vmid.to_string();
+    let vmid = vmid.to_string();
     user_info.check_privs(
         &auth_id,
-        &[
-            "resource",
-            job.source_remote.as_str(),
-            "guest",
-            vmid.as_str(),
-        ],
+        &["resource", source_remote, "guest", vmid.as_str()],
         privilege,
         false,
     )
@@ -245,7 +260,7 @@ fn read_job(
         properties: {
             id: { schema: OFFSITE_REPLICATION_ID_SCHEMA },
             job: {
-                type: OffsiteReplicationJob,
+                type: OffsiteReplicationJobUpdater,
                 flatten: true,
             },
             digest: {
@@ -261,13 +276,31 @@ fn read_job(
 /// Update an existing off-site replication job.
 fn update_job(
     id: String,
-    job: OffsiteReplicationJob,
+    job: OffsiteReplicationJobUpdater,
     digest: Option<ConfigDigest>,
     rpcenv: &mut dyn RpcEnvironment,
 ) -> Result<(), Error> {
-    if id != job.id {
-        bail!("path id and payload id must match");
-    }
+    let job = OffsiteReplicationJob {
+        id: id.clone(),
+        source_remote: job.source_remote,
+        source_node: job.source_node,
+        guest_type: job.guest_type,
+        vmid: job.vmid,
+        target_remote: job.target_remote,
+        target_node: job.target_node,
+        target_dataset: job.target_dataset,
+        schedule: job.schedule,
+        max_snapshots: job.max_snapshots,
+        history_limit: job.history_limit,
+        rate_limit_mib: job.rate_limit_mib,
+        zfs_stream_mode: job.zfs_stream_mode,
+        source_user: job.source_user,
+        target_user: job.target_user,
+        ssh_private_key: job.ssh_private_key,
+        qga_fsfreeze: job.qga_fsfreeze,
+        comment: job.comment,
+        disable: job.disable,
+    };
     validate_job(&job)?;
 
     let _lock = pdm_config::offsite_replication::lock_config()?;
@@ -412,6 +445,39 @@ fn list_recovery_points(
 #[api(
     protected: true,
     input: {
+        description: "Parameters for deleting a recoverable snapshot on the target.",
+        properties: {
+            id: { schema: OFFSITE_REPLICATION_ID_SCHEMA },
+            snapshot: {
+                description: "Source snapshot name for the recoverable point to delete.",
+                type: String,
+                min_length: 3,
+                max_length: 512,
+            },
+        },
+    },
+    access: {
+        permission: &Permission::Privilege(&["resource"], PRIV_RESOURCE_MANAGE, true),
+    },
+)]
+/// Delete one recoverable snapshot from target storage.
+fn delete_recovery_snapshot(
+    id: String,
+    snapshot: String,
+    rpcenv: &mut dyn RpcEnvironment,
+) -> Result<(), Error> {
+    let (config, _) = pdm_config::offsite_replication::config()?;
+    let Some(job) = find_job(&config.jobs, &id) else {
+        http_bail!(NOT_FOUND, "job '{}' does not exist", id);
+    };
+    check_source_guest_privs(rpcenv, job, PRIV_RESOURCE_MANAGE)?;
+    check_target_remote_privs(rpcenv, &job.target_remote, PRIV_RESOURCE_MANAGE)?;
+    crate::offsite_replication::delete_recovery_point(job, snapshot.trim())
+}
+
+#[api(
+    protected: true,
+    input: {
         description: "Parameters for starting an off-site replication job immediately.",
         properties: {
             id: { schema: OFFSITE_REPLICATION_ID_SCHEMA },
@@ -438,6 +504,69 @@ fn run_now(id: String, rpcenv: &mut dyn RpcEnvironment) -> Result<String, Error>
         .parse()?;
 
     crate::offsite_replication::run_job_now(job.clone(), &auth_id)
+}
+
+#[api(
+    protected: true,
+    input: {
+        description: "Parameters for preparing SSH access for off-site replication setup.",
+        properties: {
+            request: {
+                type: OffsiteSshPrepareRequest,
+                flatten: true,
+            },
+        },
+    },
+    access: {
+        permission: &Permission::Privilege(&["resource"], PRIV_RESOURCE_MANAGE, true),
+    },
+    returns: { type: OffsiteSshPrepareResult },
+)]
+/// Prepare SSH users/keys for off-site replication setup.
+fn prepare_ssh(
+    request: OffsiteSshPrepareRequest,
+    rpcenv: &mut dyn RpcEnvironment,
+) -> Result<OffsiteSshPrepareResult, Error> {
+    check_source_guest_privs_for(
+        rpcenv,
+        &request.source_remote,
+        request.vmid,
+        PRIV_RESOURCE_MANAGE,
+    )?;
+    check_target_remote_privs(rpcenv, &request.target_remote, PRIV_RESOURCE_MANAGE)?;
+    crate::offsite_replication::prepare_ssh(&request)
+}
+
+#[api(
+    protected: true,
+    input: {
+        description: "Parameters for generating an SSH keypair for off-site replication setup.",
+        properties: {
+            request: {
+                type: OffsiteSshKeygenRequest,
+                flatten: true,
+            },
+        },
+    },
+    access: {
+        permission: &Permission::Privilege(&["resource"], PRIV_RESOURCE_MANAGE, true),
+    },
+    returns: { type: OffsiteSshKeygenResult },
+)]
+/// Generate an SSH keypair on the PDM host for off-site replication setup.
+fn keygen_ssh(
+    request: OffsiteSshKeygenRequest,
+    rpcenv: &mut dyn RpcEnvironment,
+) -> Result<OffsiteSshKeygenResult, Error> {
+    check_source_guest_privs_for(
+        rpcenv,
+        &request.source_remote,
+        request.vmid,
+        PRIV_RESOURCE_MANAGE,
+    )?;
+    check_target_remote_privs(rpcenv, &request.target_remote, PRIV_RESOURCE_MANAGE)?;
+
+    crate::offsite_replication::generate_ssh_keypair(&request)
 }
 
 #[api(

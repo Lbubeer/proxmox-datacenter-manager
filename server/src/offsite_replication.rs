@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::time::Instant;
 
@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use pdm_api_types::{
     Authid, OffsiteFailoverRequest, OffsiteRecoveryPoint, OffsiteReplicationJob,
     OffsiteReplicationJobStatus, OffsiteReplicationRun, OffsiteReplicationRuntimeStatus,
-    DEFAULT_OFFSITE_REPLICATION_HISTORY_LIMIT,
+    OffsiteSshKeygenRequest, OffsiteSshKeygenResult, OffsiteSshPrepareRequest,
+    OffsiteSshPrepareResult, OffsiteSshPrepareStep, DEFAULT_OFFSITE_REPLICATION_HISTORY_LIMIT,
 };
 
 use crate::jobstate::{self, Job, JobState};
@@ -27,6 +28,11 @@ const RECOVERY_CONFIG_DIR: &str = concat!(
     pdm_buildcfg::PDM_STATE_DIR_M!(),
     "/offsite-replication-configs"
 );
+const SSH_STEP_CODE_CONNECT_AUTH_FAILED: &str = "connect_auth_failed";
+const SSH_STEP_CODE_CONNECT_FAILED: &str = "connect_failed";
+const SSH_STEP_CODE_MISSING_PRIVATE_KEY: &str = "missing_private_key";
+const SSH_STEP_CODE_UNREADABLE_PRIVATE_KEY: &str = "unreadable_private_key";
+const SSH_STEP_CODE_KEY_CHECK_FAILED: &str = "key_check_failed";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct JobHistoryFile {
@@ -328,7 +334,7 @@ fn run_ssh_script(
     command
         .arg(format!("{user}@{host}"))
         .arg("--")
-        .arg("/bin/sh")
+        .arg("/bin/bash")
         .arg("-lc")
         .arg(shell_escape(script));
 
@@ -411,6 +417,633 @@ fn run_ssh_script_checked(
     }
 
     Ok(merged)
+}
+
+fn ssh_prepare_step(name: &str, ok: bool, message: String) -> OffsiteSshPrepareStep {
+    OffsiteSshPrepareStep {
+        code: Some(name.to_string()),
+        field: None,
+        name: name.to_string(),
+        ok,
+        message,
+        remediation: None,
+    }
+}
+
+fn ssh_prepare_step_err(
+    name: &str,
+    message: String,
+    remediation: Option<String>,
+) -> OffsiteSshPrepareStep {
+    OffsiteSshPrepareStep {
+        code: Some(name.to_string()),
+        field: None,
+        name: name.to_string(),
+        ok: false,
+        message,
+        remediation,
+    }
+}
+
+fn ssh_prepare_step_skipped(
+    name: &str,
+    message: String,
+    remediation: Option<String>,
+) -> OffsiteSshPrepareStep {
+    OffsiteSshPrepareStep {
+        code: Some("skipped".to_string()),
+        field: None,
+        name: name.to_string(),
+        ok: false,
+        message,
+        remediation,
+    }
+}
+
+fn ssh_prepare_step_err_with_code(
+    name: &str,
+    code: &str,
+    field: Option<&str>,
+    message: String,
+    remediation: Option<String>,
+) -> OffsiteSshPrepareStep {
+    OffsiteSshPrepareStep {
+        code: Some(code.to_string()),
+        field: field.map(str::to_string),
+        name: name.to_string(),
+        ok: false,
+        message,
+        remediation,
+    }
+}
+
+fn ssh_prepare_user_remediation(remote: &str, node: &str, user: &str) -> String {
+    if user == "root" {
+        return format!(
+            "On {remote}/{node}, ensure root SSH login is allowed and the public key is present.\n\
+             Example:\n\
+             install -d -m 700 /root/.ssh\n\
+             touch /root/.ssh/authorized_keys\n\
+             chmod 600 /root/.ssh/authorized_keys\n\
+             chown -R root:root /root/.ssh\n\
+             # verify sshd allows key auth for root (PermitRootLogin + PubkeyAuthentication)\n\
+             # then restart sshd"
+        );
+    }
+
+    format!(
+        "On {remote}/{node}, create or unlock user '{user}' and install the public key.\n\
+         Example:\n\
+         useradd -m -s /bin/bash {user} || true\n\
+         install -d -m 700 ~{user}/.ssh\n\
+         touch ~{user}/.ssh/authorized_keys\n\
+         chown -R {user}:{user} ~{user}/.ssh\n\
+         chmod 600 ~{user}/.ssh/authorized_keys"
+    )
+}
+
+fn read_public_key_for_prepare(ssh_private_key: &str) -> Result<String, Error> {
+    let private_path = std::path::Path::new(ssh_private_key);
+    if !private_path.exists() {
+        bail!("private key '{}' does not exist", ssh_private_key);
+    }
+
+    let public_path = format!("{ssh_private_key}.pub");
+    if let Ok(public) = std::fs::read_to_string(&public_path) {
+        let line = public.lines().next().unwrap_or("").trim();
+        if !line.is_empty() {
+            return Ok(line.to_string());
+        }
+    }
+
+    let output = Command::new("ssh-keygen")
+        .arg("-y")
+        .arg("-f")
+        .arg(ssh_private_key)
+        .output()
+        .with_context(|| format!("failed to derive public key for '{}'", ssh_private_key))?;
+
+    if !output.status.success() {
+        bail!(
+            "failed to derive public key for '{}': {}",
+            ssh_private_key,
+            merge_command_output(&output)
+        );
+    }
+
+    let public = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if public.is_empty() {
+        bail!("derived public key for '{}' is empty", ssh_private_key);
+    }
+
+    Ok(public)
+}
+
+fn key_check_error_code(message: &str) -> &'static str {
+    if message.contains("does not exist") {
+        SSH_STEP_CODE_MISSING_PRIVATE_KEY
+    } else if message.contains("Permission denied") || message.contains("not readable") {
+        SSH_STEP_CODE_UNREADABLE_PRIVATE_KEY
+    } else {
+        SSH_STEP_CODE_KEY_CHECK_FAILED
+    }
+}
+
+fn connect_error_code(message: &str) -> &'static str {
+    if message.contains("Permission denied") {
+        SSH_STEP_CODE_CONNECT_AUTH_FAILED
+    } else {
+        SSH_STEP_CODE_CONNECT_FAILED
+    }
+}
+
+fn create_key_parent_dir(path: &std::path::Path) -> Result<(), Error> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::format_err!("invalid key path '{}'", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create directory '{}'", parent.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to set permissions on '{}'", parent.display()))?;
+    }
+    Ok(())
+}
+
+fn ssh_keygen_fingerprint(public_key_path: &std::path::Path) -> Result<String, Error> {
+    let output = Command::new("ssh-keygen")
+        .arg("-lf")
+        .arg(public_key_path)
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to read fingerprint from '{}'",
+                public_key_path.display()
+            )
+        })?;
+    if !output.status.success() {
+        bail!(
+            "failed to read fingerprint: {}",
+            merge_command_output(&output)
+        );
+    }
+    let line = String::from_utf8_lossy(&output.stdout);
+    let fp = line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| anyhow::format_err!("unable to parse key fingerprint"))?;
+    Ok(fp.to_string())
+}
+
+pub fn generate_ssh_keypair(
+    request: &OffsiteSshKeygenRequest,
+) -> Result<OffsiteSshKeygenResult, Error> {
+    let key_path = std::path::Path::new(&request.ssh_private_key);
+    if !key_path.is_absolute() {
+        bail!("ssh private key path must be absolute");
+    }
+
+    create_key_parent_dir(key_path)?;
+
+    let pub_path = std::path::PathBuf::from(format!("{}.pub", request.ssh_private_key));
+    let private_exists = key_path.exists();
+    let public_exists = pub_path.exists();
+    let any_exists = private_exists || public_exists;
+
+    if any_exists && !request.overwrite {
+        return Ok(OffsiteSshKeygenResult {
+            ok: false,
+            status: "exists".to_string(),
+            ssh_private_key: request.ssh_private_key.clone(),
+            fingerprint: None,
+            message: format!(
+                "SSH key path '{}' already exists. Confirm overwrite to replace it.",
+                request.ssh_private_key
+            ),
+        });
+    }
+
+    if any_exists {
+        if key_path.exists() {
+            std::fs::remove_file(key_path)
+                .with_context(|| format!("failed to remove '{}'", key_path.display()))?;
+        }
+        if pub_path.exists() {
+            std::fs::remove_file(&pub_path)
+                .with_context(|| format!("failed to remove '{}'", pub_path.display()))?;
+        }
+    }
+
+    let output = Command::new("ssh-keygen")
+        .arg("-q")
+        .arg("-t")
+        .arg("ed25519")
+        .arg("-N")
+        .arg("")
+        .arg("-f")
+        .arg(&request.ssh_private_key)
+        .output()
+        .with_context(|| "failed to execute ssh-keygen".to_string())?;
+    if !output.status.success() {
+        bail!("ssh-keygen failed: {}", merge_command_output(&output));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to set mode on '{}'", key_path.display()))?;
+        std::fs::set_permissions(&pub_path, std::fs::Permissions::from_mode(0o644))
+            .with_context(|| format!("failed to set mode on '{}'", pub_path.display()))?;
+    }
+
+    let fingerprint = ssh_keygen_fingerprint(&pub_path).ok();
+    let overwritten = any_exists && request.overwrite;
+    Ok(OffsiteSshKeygenResult {
+        ok: true,
+        status: if overwritten {
+            "overwritten".to_string()
+        } else {
+            "created".to_string()
+        },
+        ssh_private_key: request.ssh_private_key.clone(),
+        fingerprint,
+        message: if overwritten {
+            format!("Replaced SSH keypair at '{}'.", request.ssh_private_key)
+        } else {
+            format!("Created SSH keypair at '{}'.", request.ssh_private_key)
+        },
+    })
+}
+
+fn install_authorized_key(
+    remote: &str,
+    node: &str,
+    user: &str,
+    ssh_private_key: &str,
+    public_key: &str,
+) -> Result<(), Error> {
+    let script = format!(
+        "set -eu\n\
+         install -d -m 700 \"$HOME/.ssh\"\n\
+         touch \"$HOME/.ssh/authorized_keys\"\n\
+         chmod 600 \"$HOME/.ssh/authorized_keys\"\n\
+         if ! grep -qxF {public_key} \"$HOME/.ssh/authorized_keys\"; then\n\
+           printf '%s\\n' {public_key} >> \"$HOME/.ssh/authorized_keys\"\n\
+         fi\n",
+        public_key = shell_escape(public_key),
+    );
+
+    run_ssh_script_checked(remote, node, user, ssh_private_key, &script)?;
+    Ok(())
+}
+
+fn copy_key_to_source_host(
+    request: &OffsiteSshPrepareRequest,
+    source_host: &str,
+    source_port: Option<u16>,
+) -> Result<(), Error> {
+    let key_path = std::path::Path::new(&request.ssh_private_key);
+    if !key_path.exists() {
+        bail!("private key '{}' does not exist", request.ssh_private_key);
+    }
+
+    let destination = format!(
+        "{}@{}:{}",
+        request.source_user,
+        normalize_host_for_connection(source_host),
+        request.ssh_private_key
+    );
+
+    let mut command = Command::new("scp");
+    command
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new")
+        .arg("-i")
+        .arg(&request.ssh_private_key);
+    if let Some(port) = normalize_ssh_port(source_port) {
+        command.arg("-P").arg(port.to_string());
+    }
+    command.arg(&request.ssh_private_key).arg(&destination);
+
+    let output = command
+        .output()
+        .with_context(|| "failed to copy SSH key to source host".to_string())?;
+    if !output.status.success() {
+        bail!(
+            "failed to copy SSH key to source host: {}",
+            merge_command_output(&output)
+        );
+    }
+
+    let script = format!(
+        "set -eu\n\
+         install -d -m 700 \"$HOME/.ssh\"\n\
+         chmod 600 {key}\n\
+         if [ ! -s {key_pub} ]; then\n\
+           ssh-keygen -y -f {key} > {key_pub}\n\
+         fi\n\
+         chmod 644 {key_pub}\n",
+        key = shell_escape(&request.ssh_private_key),
+        key_pub = shell_escape(&format!("{}.pub", request.ssh_private_key)),
+    );
+
+    run_ssh_script_checked(
+        &request.source_remote,
+        &request.source_node,
+        &request.source_user,
+        &request.ssh_private_key,
+        &script,
+    )?;
+
+    Ok(())
+}
+
+fn verify_source_to_target_hop(
+    request: &OffsiteSshPrepareRequest,
+    target_host: &str,
+    target_port: Option<u16>,
+) -> Result<(), Error> {
+    let target = format!(
+        "{}@{}",
+        request.target_user,
+        normalize_host_for_connection(target_host)
+    );
+    let port_opt = normalize_ssh_port(target_port)
+        .map(|port| format!("-p {port} "))
+        .unwrap_or_default();
+    let script = format!(
+        "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i {key} {port}{target} -- true",
+        key = shell_escape(&request.ssh_private_key),
+        port = port_opt,
+        target = shell_escape(&target),
+    );
+
+    run_ssh_script_checked(
+        &request.source_remote,
+        &request.source_node,
+        &request.source_user,
+        &request.ssh_private_key,
+        &script,
+    )?;
+    Ok(())
+}
+
+pub fn prepare_ssh(request: &OffsiteSshPrepareRequest) -> Result<OffsiteSshPrepareResult, Error> {
+    let (source_host, source_port) =
+        resolve_node_host(&request.source_remote, &request.source_node)
+            .with_context(|| "failed to resolve source node host")?;
+    let (target_host, target_port) =
+        resolve_node_host(&request.target_remote, &request.target_node)
+            .with_context(|| "failed to resolve target node host")?;
+
+    let mut result = OffsiteSshPrepareResult {
+        ok: false,
+        source_host: source_host.clone(),
+        target_host: target_host.clone(),
+        steps: Vec::new(),
+    };
+
+    let public_key = match read_public_key_for_prepare(&request.ssh_private_key) {
+        Ok(key) => {
+            result.steps.push(ssh_prepare_step(
+                "key-check",
+                true,
+                "SSH private/public key on PDM host is usable.".to_string(),
+            ));
+            key
+        }
+        Err(err) => {
+            let message = err.to_string();
+            result.steps.push(ssh_prepare_step_err_with_code(
+                "key-check",
+                key_check_error_code(&message),
+                Some("ssh-private-key"),
+                message,
+                Some(format!(
+                    "Ensure '{}' exists and is readable by the PDM service user.",
+                    request.ssh_private_key
+                )),
+            ));
+            return Ok(result);
+        }
+    };
+
+    let source_connected = match run_ssh_script_checked(
+        &request.source_remote,
+        &request.source_node,
+        &request.source_user,
+        &request.ssh_private_key,
+        "id -un >/dev/null",
+    ) {
+        Ok(_) => {
+            result.steps.push(ssh_prepare_step(
+                "source-connect",
+                true,
+                "Connected to source node over SSH.".to_string(),
+            ));
+            true
+        }
+        Err(err) => {
+            let message = err.to_string();
+            result.steps.push(ssh_prepare_step_err_with_code(
+                "source-connect",
+                connect_error_code(&message),
+                Some("source-user"),
+                message,
+                Some(ssh_prepare_user_remediation(
+                    &request.source_remote,
+                    &request.source_node,
+                    &request.source_user,
+                )),
+            ));
+            false
+        }
+    };
+
+    let target_connected = match run_ssh_script_checked(
+        &request.target_remote,
+        &request.target_node,
+        &request.target_user,
+        &request.ssh_private_key,
+        "id -un >/dev/null",
+    ) {
+        Ok(_) => {
+            result.steps.push(ssh_prepare_step(
+                "target-connect",
+                true,
+                "Connected to target node over SSH.".to_string(),
+            ));
+            true
+        }
+        Err(err) => {
+            let message = err.to_string();
+            result.steps.push(ssh_prepare_step_err_with_code(
+                "target-connect",
+                connect_error_code(&message),
+                Some("target-user"),
+                message,
+                Some(ssh_prepare_user_remediation(
+                    &request.target_remote,
+                    &request.target_node,
+                    &request.target_user,
+                )),
+            ));
+            false
+        }
+    };
+
+    if request.install_authorized_keys {
+        if source_connected {
+            if let Err(err) = install_authorized_key(
+                &request.source_remote,
+                &request.source_node,
+                &request.source_user,
+                &request.ssh_private_key,
+                &public_key,
+            ) {
+                result.steps.push(ssh_prepare_step_err(
+                    "source-authorized-keys",
+                    err.to_string(),
+                    Some(ssh_prepare_user_remediation(
+                        &request.source_remote,
+                        &request.source_node,
+                        &request.source_user,
+                    )),
+                ));
+            } else {
+                result.steps.push(ssh_prepare_step(
+                    "source-authorized-keys",
+                    true,
+                    "Installed/verified public key on source user authorized_keys.".to_string(),
+                ));
+            }
+        } else {
+            result.steps.push(ssh_prepare_step_skipped(
+                "source-authorized-keys",
+                "Skipped because source-connect failed.".to_string(),
+                Some(ssh_prepare_user_remediation(
+                    &request.source_remote,
+                    &request.source_node,
+                    &request.source_user,
+                )),
+            ));
+        }
+
+        if target_connected {
+            if let Err(err) = install_authorized_key(
+                &request.target_remote,
+                &request.target_node,
+                &request.target_user,
+                &request.ssh_private_key,
+                &public_key,
+            ) {
+                result.steps.push(ssh_prepare_step_err(
+                    "target-authorized-keys",
+                    err.to_string(),
+                    Some(ssh_prepare_user_remediation(
+                        &request.target_remote,
+                        &request.target_node,
+                        &request.target_user,
+                    )),
+                ));
+            } else {
+                result.steps.push(ssh_prepare_step(
+                    "target-authorized-keys",
+                    true,
+                    "Installed/verified public key on target user authorized_keys.".to_string(),
+                ));
+            }
+        } else {
+            result.steps.push(ssh_prepare_step_skipped(
+                "target-authorized-keys",
+                "Skipped because target-connect failed.".to_string(),
+                Some(ssh_prepare_user_remediation(
+                    &request.target_remote,
+                    &request.target_node,
+                    &request.target_user,
+                )),
+            ));
+        }
+    } else {
+        result.steps.push(ssh_prepare_step(
+            "authorized-keys",
+            true,
+            "authorized_keys installation skipped by option.".to_string(),
+        ));
+    }
+
+    if request.copy_key_to_source {
+        if source_connected {
+            if let Err(err) = copy_key_to_source_host(request, &source_host, source_port) {
+                result.steps.push(ssh_prepare_step_err(
+                    "copy-key-to-source",
+                    err.to_string(),
+                    Some(format!(
+                        "Ensure source user '{}' can write '{}' and retry with copy enabled.",
+                        request.source_user, request.ssh_private_key
+                    )),
+                ));
+            } else {
+                result.steps.push(ssh_prepare_step(
+                    "copy-key-to-source",
+                    true,
+                    "Copied key material to source host for source->target hop.".to_string(),
+                ));
+            }
+        } else {
+            result.steps.push(ssh_prepare_step_skipped(
+                "copy-key-to-source",
+                "Skipped because source-connect failed.".to_string(),
+                Some(ssh_prepare_user_remediation(
+                    &request.source_remote,
+                    &request.source_node,
+                    &request.source_user,
+                )),
+            ));
+        }
+    } else {
+        result.steps.push(ssh_prepare_step(
+            "copy-key-to-source",
+            true,
+            "Source key copy skipped by option.".to_string(),
+        ));
+    }
+
+    if source_connected && target_connected {
+        if let Err(err) = verify_source_to_target_hop(request, &target_host, target_port) {
+            result.steps.push(ssh_prepare_step_err(
+                "source-to-target-hop",
+                err.to_string(),
+                Some(
+                    "Verify source user key access to target, or rerun with 'Copy key to source' enabled."
+                        .to_string(),
+                ),
+            ));
+        } else {
+            result.steps.push(ssh_prepare_step(
+                "source-to-target-hop",
+                true,
+                "Source host can open SSH hop to target host.".to_string(),
+            ));
+        }
+    } else {
+        result.steps.push(ssh_prepare_step_skipped(
+            "source-to-target-hop",
+            "Skipped because source or target connectivity failed.".to_string(),
+            Some(
+                "Fix source-connect and target-connect failures, then rerun Prepare SSH."
+                    .to_string(),
+            ),
+        ));
+    }
+
+    result.ok = result.steps.iter().all(|step| step.ok);
+    Ok(result)
 }
 
 fn is_qemu_disk_key(key: &str) -> bool {
@@ -499,6 +1132,10 @@ fn parse_qemu_config(config: &str, source_vmid: u32) -> Result<ParsedQemuConfig,
         }
 
         if is_qemu_disk_key(key) {
+            if key.starts_with("unused") {
+                continue;
+            }
+
             if value.contains("media=cdrom") {
                 continue;
             }
@@ -557,18 +1194,94 @@ fn recovery_storage_id(job_id: &str) -> String {
     storage_id
 }
 
-fn source_snapshot_to_target_snapshot(
-    job: &OffsiteReplicationJob,
-    source_snapshot: &str,
-) -> Result<String, Error> {
-    let (source_dataset, suffix) = source_snapshot
-        .rsplit_once('@')
-        .context("snapshot is missing '@' separator")?;
+fn sanitize_dataset_component(component: &str) -> String {
+    component
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn target_dataset_for_source_dataset(target_dataset: &str, source_dataset: &str) -> String {
+    let encoded = source_dataset
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .map(sanitize_dataset_component)
+        .collect::<Vec<_>>()
+        .join("__");
+    format!("{target_dataset}/{encoded}")
+}
+
+fn legacy_target_dataset_for_source_dataset(target_dataset: &str, source_dataset: &str) -> String {
     let basename = source_dataset
         .rsplit('/')
         .next()
-        .context("snapshot is missing source dataset basename")?;
-    Ok(format!("{}/{basename}@{suffix}", job.target_dataset))
+        .unwrap_or(source_dataset)
+        .trim();
+    format!("{target_dataset}/{basename}")
+}
+
+fn source_snapshot_to_target_snapshot_candidates(
+    job: &OffsiteReplicationJob,
+    source_snapshot: &str,
+) -> Result<Vec<String>, Error> {
+    let (source_dataset, suffix) = source_snapshot
+        .rsplit_once('@')
+        .context("snapshot is missing '@' separator")?;
+
+    let mut candidates = Vec::new();
+    let target_prefix = format!("{}/", job.target_dataset);
+    if source_dataset == job.target_dataset || source_dataset.starts_with(&target_prefix) {
+        candidates.push(format!("{source_dataset}@{suffix}"));
+    }
+
+    let primary = format!(
+        "{}@{suffix}",
+        target_dataset_for_source_dataset(&job.target_dataset, source_dataset)
+    );
+    let legacy = format!(
+        "{}@{suffix}",
+        legacy_target_dataset_for_source_dataset(&job.target_dataset, source_dataset)
+    );
+
+    for candidate in [primary, legacy] {
+        if !candidates.iter().any(|entry| entry == &candidate) {
+            candidates.push(candidate);
+        }
+    }
+
+    Ok(candidates)
+}
+
+fn resolve_selected_target_snapshot(
+    job: &OffsiteReplicationJob,
+    source_snapshot: &str,
+) -> Result<String, Error> {
+    let candidates = source_snapshot_to_target_snapshot_candidates(job, source_snapshot)?;
+    let existing = list_existing_target_snapshots(job, &candidates)?;
+    candidates
+        .into_iter()
+        .find(|candidate| existing.contains(candidate))
+        .context("selected recovery snapshot could not be resolved on target")
+}
+
+fn selected_lineage_prefix_from_target_snapshot(
+    job: &OffsiteReplicationJob,
+    target_snapshot: &str,
+) -> Option<String> {
+    let (dataset, _) = target_snapshot.rsplit_once('@')?;
+    let relative_dataset = dataset.strip_prefix(&format!("{}/", job.target_dataset))?;
+    let (prefix, _) = relative_dataset.rsplit_once("__")?;
+    if prefix.is_empty() {
+        None
+    } else {
+        Some(prefix.to_string())
+    }
 }
 
 fn list_existing_target_snapshots(
@@ -612,8 +1325,9 @@ fn list_recorded_target_snapshots(job: &OffsiteReplicationJob) -> Result<Vec<Str
             continue;
         };
 
-        if let Ok(target_snapshot) = source_snapshot_to_target_snapshot(job, source_snapshot) {
-            snapshots.insert(target_snapshot);
+        if let Ok(candidates) = source_snapshot_to_target_snapshot_candidates(job, source_snapshot)
+        {
+            snapshots.extend(candidates);
         }
     }
 
@@ -681,18 +1395,19 @@ fn ensure_recovery_snapshot_available(
     job: &OffsiteReplicationJob,
     source_snapshot: &str,
 ) -> Result<(), Error> {
-    let target_snapshot = source_snapshot_to_target_snapshot(job, source_snapshot)?;
-    let check_script = format!("zfs list -H -o name {}", shell_escape(&target_snapshot));
-    let output = run_ssh_script(
-        &job.target_remote,
-        &job.target_node,
-        &job.target_user,
-        &job.ssh_private_key,
-        &check_script,
-    )?;
+    for target_snapshot in source_snapshot_to_target_snapshot_candidates(job, source_snapshot)? {
+        let check_script = format!("zfs list -H -o name {}", shell_escape(&target_snapshot));
+        let output = run_ssh_script(
+            &job.target_remote,
+            &job.target_node,
+            &job.target_user,
+            &job.ssh_private_key,
+            &check_script,
+        )?;
 
-    if output.status.success() {
-        return Ok(());
+        if output.status.success() {
+            return Ok(());
+        }
     }
 
     bail!(
@@ -707,6 +1422,7 @@ fn build_qemu_failover_script(
     request: &OffsiteFailoverRequest,
     parsed: &ParsedQemuConfig,
     target_storage_id: &str,
+    selected_lineage_prefix: Option<&str>,
 ) -> Result<String, Error> {
     let snapshot_suffix = extract_snapshot_suffix(&request.snapshot)?;
     let recovered_name = request
@@ -714,9 +1430,15 @@ fn build_qemu_failover_script(
         .clone()
         .or_else(|| parsed.name.clone().map(|name| format!("{name}-dr")))
         .unwrap_or_else(|| format!("recovery-{}", request.recovery_vmid));
+    let request_source_parent = request.snapshot.split_once('@').and_then(|(dataset, _)| {
+        dataset
+            .rsplit_once('/')
+            .map(|(parent, _)| parent.to_string())
+    });
 
-    let mut script =
-        String::from("set -eu\nSTATUS=1\nCREATED_VM=0\nCREATED_DATASETS_FILE=$(mktemp)\n");
+    let mut script = String::from(
+        "set -euo pipefail\nSTATUS=1\nCREATED_VM=0\nCREATED_DATASETS_FILE=$(mktemp)\n",
+    );
     script.push_str(&format!(
         "cleanup() {{\n  if [ \"$STATUS\" -ne 0 ]; then\n    if [ \"$CREATED_VM\" = \"1\" ]; then\n      qm stop {} >/dev/null 2>&1 || true\n      qm destroy {} --purge 1 >/dev/null 2>&1 || true\n    fi\n    # Track created datasets line-by-line to keep rollback robust for any dataset name shape.\n    if [ -f \"$CREATED_DATASETS_FILE\" ]; then\n      while IFS= read -r dataset; do\n        [ -n \"$dataset\" ] || continue\n        zfs destroy -r \"$dataset\" >/dev/null 2>&1 || true\n      done < \"$CREATED_DATASETS_FILE\"\n    fi\n  fi\n  rm -f \"$CREATED_DATASETS_FILE\"\n}}\ntrap cleanup EXIT\n",
         request.recovery_vmid, request.recovery_vmid
@@ -735,15 +1457,56 @@ fn build_qemu_failover_script(
         shell_escape(target_storage_id),
         shell_escape(&job.target_dataset),
     ));
+    script.push_str(&format!(
+        "SNAP_SUFFIX={}\nTARGET_DATASET={}\nresolve_recovery_snapshot() {{\n  source_base=\"$1\"\n  occurrence=\"$2\"\n  lineage_prefix=\"${{3:-}}\"\n  legacy=\"$TARGET_DATASET/$source_base@$SNAP_SUFFIX\"\n  if [ -z \"$lineage_prefix\" ] && [ \"$occurrence\" -eq 1 ] && zfs list -H -o name \"$legacy\" >/dev/null 2>&1; then\n    echo \"$legacy\"\n    return 0\n  fi\n\n  matches=\"$(zfs list -H -t snapshot -o name -s creation -r \"$TARGET_DATASET\" 2>/dev/null | while IFS= read -r snap; do\n    case \"$snap\" in\n      *@$SNAP_SUFFIX)\n        ds=\"${{snap%@*}}\"\n        leaf=\"${{ds##*/}}\"\n        if [ -n \"$lineage_prefix\" ]; then\n          expected=\"$lineage_prefix\"\"__\"\"$source_base\"\n          [ \"$leaf\" = \"$expected\" ] || continue\n          printf '%s\\n' \"$snap\"\n          continue\n        fi\n        if [ \"$leaf\" = \"$source_base\" ]; then\n          printf '%s\\n' \"$snap\"\n          continue\n        fi\n        case \"$leaf\" in\n          *__\"$source_base\") printf '%s\\n' \"$snap\" ;;\n        esac\n        ;;\n    esac\n  done)\"\n\n  matches_clean=\"$(printf '%s\\n' \"$matches\" | sed '/^$/d')\"\n  count=\"$(printf '%s\\n' \"$matches_clean\" | sed '/^$/d' | wc -l)\"\n  if [ \"$count\" -ge \"$occurrence\" ]; then\n    printf '%s\\n' \"$matches_clean\" | sed -n \"${{occurrence}}p\"\n    return 0\n  fi\n\n  if [ \"$count\" -eq 0 ]; then\n    echo {} >&2\n  else\n    echo {} >&2\n    printf '%s\\n' \"$matches_clean\" >&2\n  fi\n  return 1\n}}\n",
+        shell_escape(snapshot_suffix),
+        shell_escape(&job.target_dataset),
+        shell_escape("missing target recovery snapshot for selected suffix"),
+        shell_escape("ambiguous target recovery snapshots for selected suffix"),
+    ));
+
+    let mut basename_totals: HashMap<&str, usize> = HashMap::new();
+    for disk in &parsed.disks {
+        *basename_totals
+            .entry(disk.source_basename.as_str())
+            .or_insert(0) += 1;
+    }
+    let mut basename_seen: HashMap<&str, usize> = HashMap::new();
 
     for disk in &parsed.disks {
-        let target_basename =
+        let basename_key = disk.source_basename.as_str();
+        let duplicate_count = basename_totals.get(basename_key).copied().unwrap_or(0);
+        let occurrence = basename_seen
+            .entry(basename_key)
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+        let duplicate = duplicate_count > 1;
+
+        let mut target_basename =
             recover_disk_basename(&disk.source_basename, job.vmid, request.recovery_vmid)?;
-        let source_snapshot = format!(
-            "{}/{}@{}",
-            job.target_dataset, disk.source_basename, snapshot_suffix
-        );
+        if duplicate {
+            target_basename = format!(
+                "{}-{}",
+                target_basename,
+                sanitize_dataset_component(&disk.key)
+            );
+        }
         let target_dataset = format!("{}/{}", job.target_dataset, target_basename);
+        let lineage_hint = if duplicate {
+            None
+        } else {
+            selected_lineage_prefix
+        };
+        let preferred_target_snapshot = if duplicate {
+            None
+        } else {
+            request_source_parent.as_ref().map(|parent| {
+                let dataset = format!("{parent}/{}", disk.source_basename);
+                let target_dataset =
+                    target_dataset_for_source_dataset(&job.target_dataset, &dataset);
+                format!("{target_dataset}@{snapshot_suffix}")
+            })
+        };
         script.push_str(&format!(
             "zfs list -H -o name {} >/dev/null 2>&1 && {{ echo {} >&2; exit 1; }}\n",
             shell_escape(&target_dataset),
@@ -752,11 +1515,34 @@ fn build_qemu_failover_script(
                 target_dataset
             ))
         ));
+        if let Some(preferred_target_snapshot) = preferred_target_snapshot {
+            script.push_str(&format!(
+                "if zfs list -H -o name {} >/dev/null 2>&1; then\n  source_snapshot={}\nelse\n  source_snapshot=\"$(resolve_recovery_snapshot {} {} {})\"\nfi\n",
+                shell_escape(&preferred_target_snapshot),
+                shell_escape(&preferred_target_snapshot),
+                shell_escape(&disk.source_basename),
+                occurrence,
+                shell_escape(lineage_hint.unwrap_or("")),
+            ));
+        } else {
+            script.push_str(&format!(
+                "source_snapshot=\"$(resolve_recovery_snapshot {} {} {})\"\n",
+                shell_escape(&disk.source_basename),
+                occurrence,
+                shell_escape(lineage_hint.unwrap_or("")),
+            ));
+        }
         script.push_str(&format!(
-            "zfs send -p {} | zfs recv -u {}\nprintf '%s\\n' {} >> \"$CREATED_DATASETS_FILE\"\n",
-            shell_escape(&source_snapshot),
+            "printf '%s\\n' {} >> \"$CREATED_DATASETS_FILE\"\nzfs send -w {} | zfs recv -u {}\nif [ \"$(zfs get -H -o value encryption {} 2>/dev/null || echo off)\" != \"off\" ]; then\n  key_status=\"$(zfs get -H -o value keystatus {} 2>/dev/null || echo unavailable)\"\n  if [ \"$key_status\" != \"available\" ]; then\n    echo {} >&2\n    exit 1\n  fi\nfi\n",
             shell_escape(&target_dataset),
-            shell_escape(&target_dataset)
+            "\"$source_snapshot\"",
+            shell_escape(&target_dataset),
+            shell_escape(&target_dataset),
+            shell_escape(&target_dataset),
+            shell_escape(&format!(
+                "target recovery dataset '{}' is encrypted but key is unavailable; load key on target before failover",
+                target_dataset
+            )),
         ));
     }
 
@@ -858,7 +1644,16 @@ fn execute_failover(
     let stored_config = load_recovery_guest_config(&job.id, &request.snapshot)?;
     let parsed = parse_qemu_config(&stored_config, job.vmid)?;
     let target_storage_id = recovery_storage_id(&job.id);
-    let script = build_qemu_failover_script(job, request, &parsed, &target_storage_id)?;
+    let selected_target_snapshot = resolve_selected_target_snapshot(job, &request.snapshot)?;
+    let selected_lineage_prefix =
+        selected_lineage_prefix_from_target_snapshot(job, &selected_target_snapshot);
+    let script = build_qemu_failover_script(
+        job,
+        request,
+        &parsed,
+        &target_storage_id,
+        selected_lineage_prefix.as_deref(),
+    )?;
 
     run_ssh_script_checked(
         &job.target_remote,
@@ -869,17 +1664,7 @@ fn execute_failover(
     )
 }
 
-fn build_remote_script(job: &OffsiteReplicationJob, target_host: &str) -> String {
-    let mut script = String::from("set -eu\n");
-    script.push_str("FREEZE_DONE=0\n");
-
-    if job.qga_fsfreeze && matches!(job.guest_type, pdm_api_types::resource::GuestType::Qemu) {
-        script.push_str(&format!(
-            "if command -v qm >/dev/null 2>&1; then\n  if qm guest cmd {} fsfreeze-freeze >/dev/null 2>&1; then\n    FREEZE_DONE=1\n    echo \"QGA fsfreeze: freeze ok\"\n  else\n    echo \"QGA fsfreeze: freeze skipped\"\n  fi\nelse\n  echo \"QGA fsfreeze: qm command unavailable\"\nfi\n",
-            job.vmid
-        ));
-    }
-
+fn build_plain_sync_command(job: &OffsiteReplicationJob, target_host: &str) -> String {
     let mut cmd = format!(
         "pve-zsync sync --source {} --dest {}:{} --name {} --maxsnap {} --method ssh --source-user {} --dest-user {} --verbose",
         job.vmid,
@@ -896,11 +1681,229 @@ fn build_remote_script(job: &OffsiteReplicationJob, target_host: &str) -> String
         cmd.push_str(&format!(" --limit {limit_kib}"));
     }
 
+    cmd
+}
+
+fn build_remote_script(job: &OffsiteReplicationJob, target_host: &str) -> String {
+    let mut script = String::from("set -euo pipefail\n");
+    script.push_str("FREEZE_DONE=0\n");
+
+    if job.qga_fsfreeze && matches!(job.guest_type, pdm_api_types::resource::GuestType::Qemu) {
+        script.push_str(&format!(
+            "echo \"QGA fsfreeze: freeze requested\"\nif command -v qm >/dev/null 2>&1; then\n  if FREEZE_OUTPUT=\"$(qm guest cmd {} fsfreeze-freeze 2>&1)\"; then\n    FREEZE_DONE=1\n    echo \"QGA fsfreeze: freeze ok\"\n  else\n    FREEZE_OUTPUT=\"$(printf '%s' \"$FREEZE_OUTPUT\" | tr '\\n' ' ' | sed 's/[[:space:]]\\+/ /g')\"\n    if [ -n \"$FREEZE_OUTPUT\" ]; then\n      echo \"QGA fsfreeze: freeze skipped ($FREEZE_OUTPUT)\"\n    else\n      echo \"QGA fsfreeze: freeze skipped (command returned non-zero)\"\n    fi\n  fi\nelse\n  echo \"QGA fsfreeze: qm command unavailable\"\nfi\n",
+            job.vmid
+        ));
+    }
+
+    let plain_cmd = build_plain_sync_command(job, target_host);
+    let rate_limit_kib = job.rate_limit_mib.map(|value| value * 1024).unwrap_or(0);
+    script.push_str(&format!(
+        "STREAM_MODE_CONFIG={}\nEFFECTIVE_STREAM_MODE=\"$STREAM_MODE_CONFIG\"\nJOB_ID={}\nVMID={}\nGUEST_TYPE={}\nTARGET_HOST={}\nTARGET_DATASET={}\nSOURCE_USER={}\nTARGET_USER={}\nMAXSNAP={}\nRATE_LIMIT_KIB={}\n",
+        shell_escape(job.zfs_stream_mode.as_str()),
+        shell_escape(&job.id),
+        job.vmid,
+        shell_escape(match job.guest_type {
+            pdm_api_types::resource::GuestType::Qemu => "qemu",
+            pdm_api_types::resource::GuestType::Lxc => "lxc",
+        }),
+        shell_escape(target_host),
+        shell_escape(&job.target_dataset),
+        shell_escape(&job.source_user),
+        shell_escape(&job.target_user),
+        job.max_snapshots,
+        rate_limit_kib,
+    ));
+
+    script.push_str(
+        r#"
+collect_volids() {
+  if [ "$GUEST_TYPE" = "qemu" ]; then
+    qm config "$VMID" --current | awk -F': ' '/^(virtio|ide|scsi|sata|efidisk|tpmstate)[0-9]+: /{print $2}' | cut -d, -f1
+  else
+    pct config "$VMID" | awk -F': ' '/^(rootfs|mp[0-9]+): /{print $2}' | cut -d, -f1
+  fi
+}
+
+resolve_dataset_from_volid() {
+  volid="$1"
+  path="$(pvesm path "$volid" 2>/dev/null || true)"
+  [ -n "$path" ] || return 1
+
+  case "$path" in
+    /dev/zvol/*)
+      echo "${path#/dev/zvol/}"
+      return 0
+      ;;
+  esac
+
+  if zfs list -H -o name "$path" >/dev/null 2>&1; then
+    echo "$path"
+    return 0
+  fi
+
+  case "$path" in
+    /*)
+      dataset="${path#/}"
+      if zfs list -H -o name "$dataset" >/dev/null 2>&1; then
+        echo "$dataset"
+        return 0
+      fi
+      ;;
+  esac
+
+  return 1
+}
+
+collect_source_datasets() {
+  collect_volids | while read -r volid; do
+    [ -n "$volid" ] || continue
+    if dataset="$(resolve_dataset_from_volid "$volid")"; then
+      echo "$dataset"
+    else
+      echo "WARN: skipping volume '$volid' (non-ZFS or unresolved path)" >&2
+    fi
+  done | awk '!seen[$0]++'
+}
+
+target_dataset_for_source() {
+  source_ds="$1"
+  encoded="$(printf '%s' "$source_ds" | sed 's#/#__#g')"
+  echo "$TARGET_DATASET/$encoded"
+}
+
+ensure_target_dataset_exists() {
+  target_ds="$1"
+  ssh -o BatchMode=yes "$TARGET_USER@$TARGET_HOST" -- zfs list -H -o name "$target_ds" >/dev/null 2>&1 || \
+    ssh -o BatchMode=yes "$TARGET_USER@$TARGET_HOST" -- zfs create -p "$target_ds"
+}
+
+last_target_snapshot_for_dataset() {
+  target_ds="$1"
+  ssh -o BatchMode=yes "$TARGET_USER@$TARGET_HOST" -- \
+    zfs list -H -t snapshot -o name -s creation "$target_ds" 2>/dev/null | \
+    awk -v p="${target_ds}@rep_${JOB_ID}_" 'index($0,p)==1 {last=$0} END {print last}'
+}
+
+prune_source_snapshots() {
+  source_ds="$1"
+  snaps="$(zfs list -H -t snapshot -o name -s creation "$source_ds" 2>/dev/null | awk -v p="${source_ds}@rep_${JOB_ID}_" 'index($0,p)==1')"
+  count="$(printf '%s\n' "$snaps" | sed '/^$/d' | wc -l)"
+  if [ "$count" -gt "$MAXSNAP" ]; then
+    trim="$((count - MAXSNAP))"
+    printf '%s\n' "$snaps" | sed '/^$/d' | head -n "$trim" | while read -r old; do
+      zfs destroy "$old" >/dev/null 2>&1 || echo "WARN: could not destroy source snapshot $old" >&2
+    done
+  fi
+}
+
+prune_target_snapshots() {
+  target_ds="$1"
+  snaps="$(ssh -o BatchMode=yes "$TARGET_USER@$TARGET_HOST" -- zfs list -H -t snapshot -o name -s creation "$target_ds" 2>/dev/null | awk -v p="${target_ds}@rep_${JOB_ID}_" 'index($0,p)==1')"
+  count="$(printf '%s\n' "$snaps" | sed '/^$/d' | wc -l)"
+  if [ "$count" -gt "$MAXSNAP" ]; then
+    trim="$((count - MAXSNAP))"
+    printf '%s\n' "$snaps" | sed '/^$/d' | head -n "$trim" | while read -r old; do
+      ssh -o BatchMode=yes "$TARGET_USER@$TARGET_HOST" -- zfs destroy "$old" >/dev/null 2>&1 || \
+        echo "WARN: could not destroy target snapshot $old" >&2
+    done
+  fi
+}
+
+run_raw_sync() {
+  datasets="$1"
+  [ -n "$datasets" ] || { echo "ERROR: no ZFS-backed datasets resolved for guest $VMID" >&2; return 1; }
+
+  snap_tag="rep_${JOB_ID}_$(date '+%Y-%m-%d_%H:%M:%S')"
+  primary_logged=0
+  total_estimated=0
+
+  for source_ds in $datasets; do
+    target_ds="$(target_dataset_for_source "$source_ds")"
+
+    new_source_snapshot="${source_ds}@${snap_tag}"
+    zfs snapshot "$new_source_snapshot"
+
+    last_target_snapshot="$(last_target_snapshot_for_dataset "$target_ds")"
+    transfer_mode="full"
+    estimate=""
+    if [ -n "$last_target_snapshot" ]; then
+      last_tag="${last_target_snapshot##*@}"
+      last_source_snapshot="${source_ds}@${last_tag}"
+      if zfs list -H -o name "$last_source_snapshot" >/dev/null 2>&1; then
+        transfer_mode="incremental"
+      fi
+    fi
+
+    if [ "$transfer_mode" = "full" ] && ssh -o BatchMode=yes "$TARGET_USER@$TARGET_HOST" -- zfs list -H -o name "$target_ds" >/dev/null 2>&1; then
+      target_snapshot_count="$(ssh -o BatchMode=yes "$TARGET_USER@$TARGET_HOST" -- zfs list -H -t snapshot -o name "$target_ds" 2>/dev/null | sed '/^$/d' | wc -l)"
+      if [ "$target_snapshot_count" -eq 0 ]; then
+        echo "WARN: removing stale empty target dataset $target_ds before full raw receive" >&2
+        ssh -o BatchMode=yes "$TARGET_USER@$TARGET_HOST" -- zfs destroy -r "$target_ds"
+      else
+        echo "ERROR: target dataset $target_ds already exists with snapshots but no matching base for job $JOB_ID" >&2
+        return 1
+      fi
+    fi
+
+    if [ "$transfer_mode" = "incremental" ]; then
+      estimate="$(zfs send -nP -w -i "$last_source_snapshot" "$new_source_snapshot" 2>&1 | awk '/size[[:space:]]/ {print $2; exit}')"
+      if [ "$RATE_LIMIT_KIB" -gt 0 ]; then
+        zfs send -w -i "$last_source_snapshot" "$new_source_snapshot" | cstream -t "$RATE_LIMIT_KIB" | \
+          ssh -o BatchMode=yes "$TARGET_USER@$TARGET_HOST" -- zfs recv -u "$target_ds"
+      else
+        zfs send -w -i "$last_source_snapshot" "$new_source_snapshot" | \
+          ssh -o BatchMode=yes "$TARGET_USER@$TARGET_HOST" -- zfs recv -u "$target_ds"
+      fi
+      if [ "$primary_logged" -eq 0 ]; then
+        estimate="${estimate:-0}"
+        echo "send from $last_source_snapshot to $new_source_snapshot estimated size is ${estimate}B"
+        echo "total estimated size is ${estimate}B"
+        echo "TIME        SENT   SNAPSHOT $new_source_snapshot"
+        echo "00:00:00 ${estimate} ${new_source_snapshot}"
+        primary_logged=1
+      fi
+    else
+      estimate="$(zfs send -nP -w "$new_source_snapshot" 2>&1 | awk '/size[[:space:]]/ {print $2; exit}')"
+      if [ "$RATE_LIMIT_KIB" -gt 0 ]; then
+        zfs send -w "$new_source_snapshot" | cstream -t "$RATE_LIMIT_KIB" | \
+          ssh -o BatchMode=yes "$TARGET_USER@$TARGET_HOST" -- zfs recv -u "$target_ds"
+      else
+        zfs send -w "$new_source_snapshot" | \
+          ssh -o BatchMode=yes "$TARGET_USER@$TARGET_HOST" -- zfs recv -u "$target_ds"
+      fi
+      if [ "$primary_logged" -eq 0 ]; then
+        estimate="${estimate:-0}"
+        echo "full send of $new_source_snapshot estimated size is ${estimate}B"
+        echo "total estimated size is ${estimate}B"
+        echo "TIME        SENT   SNAPSHOT $new_source_snapshot"
+        echo "00:00:00 ${estimate} ${new_source_snapshot}"
+        primary_logged=1
+      fi
+    fi
+
+    prune_source_snapshots "$source_ds"
+    prune_target_snapshots "$target_ds"
+  done
+}
+"#,
+    );
+
+    script.push_str("SOURCE_DATASETS=\"$(collect_source_datasets)\"\n");
+    script.push_str("if [ -z \"$SOURCE_DATASETS\" ]; then\n  echo \"ERROR: guest has no ZFS-backed datasets suitable for replication\" >&2\n  exit 1\nfi\n");
+    script.push_str("ENCRYPTED_SOURCE=0\nfor source_ds in $SOURCE_DATASETS; do\n  enc=\"$(zfs get -H -o value encryption \"$source_ds\" 2>/dev/null || echo off)\"\n  if [ \"$enc\" != \"off\" ] && [ \"$enc\" != \"-\" ]; then\n    ENCRYPTED_SOURCE=1\n    break\n  fi\ndone\n");
+    script.push_str("if [ \"$STREAM_MODE_CONFIG\" = \"auto\" ]; then\n  if [ \"$ENCRYPTED_SOURCE\" = \"1\" ]; then\n    EFFECTIVE_STREAM_MODE=\"raw\"\n  else\n    EFFECTIVE_STREAM_MODE=\"plain\"\n  fi\nfi\n");
+    script.push_str("echo \"INFO: zfs-stream configured=$STREAM_MODE_CONFIG effective=$EFFECTIVE_STREAM_MODE source-encrypted=$ENCRYPTED_SOURCE\"\n");
+
     script.push_str("STATUS=0\n");
-    script.push_str(&format!("{cmd} || STATUS=$?\n"));
-    script.push_str("if [ \"$FREEZE_DONE\" = \"1\" ]; then\n  if qm guest cmd ");
+    script.push_str("if [ \"$EFFECTIVE_STREAM_MODE\" = \"plain\" ]; then\n");
+    script.push_str(&format!("  {} || STATUS=$?\n", plain_cmd));
+    script.push_str("else\n");
+    script.push_str("  run_raw_sync \"$SOURCE_DATASETS\" || STATUS=$?\n");
+    script.push_str("fi\n");
+
+    script.push_str("if [ \"$FREEZE_DONE\" = \"1\" ]; then\n  echo \"QGA fsfreeze: thaw requested\"\n  if THAW_OUTPUT=\"$(qm guest cmd ");
     script.push_str(&format!("{}", job.vmid));
-    script.push_str(" fsfreeze-thaw >/dev/null 2>&1; then\n    echo \"QGA fsfreeze: thaw ok\"\n  else\n    echo \"QGA fsfreeze: thaw failed\"\n  fi\nfi\n");
+    script.push_str(" fsfreeze-thaw 2>&1)\"; then\n    echo \"QGA fsfreeze: thaw ok\"\n  else\n    THAW_OUTPUT=\"$(printf '%s' \"$THAW_OUTPUT\" | tr '\\n' ' ' | sed 's/[[:space:]]\\+/ /g')\"\n    if [ -n \"$THAW_OUTPUT\" ]; then\n      echo \"QGA fsfreeze: thaw failed ($THAW_OUTPUT)\"\n    else\n      echo \"QGA fsfreeze: thaw failed\"\n    fi\n  fi\nfi\n");
     script.push_str("exit \"$STATUS\"\n");
 
     script
@@ -918,8 +1921,10 @@ fn run_option_summary(job: &OffsiteReplicationJob) -> String {
         (false, pdm_api_types::resource::GuestType::Lxc) => "not-applicable",
     };
     format!(
-        "INFO: options rate-limit={rate_limit}, qga-fsfreeze={qga_mode}, max-snapshots={}, history-limit={}",
-        job.max_snapshots, job.history_limit
+        "INFO: options rate-limit={rate_limit}, qga-fsfreeze={qga_mode}, zfs-stream={}, max-snapshots={}, history-limit={}",
+        job.zfs_stream_mode.as_str(),
+        job.max_snapshots,
+        job.history_limit
     )
 }
 
@@ -1049,7 +2054,7 @@ pub fn list_history(
 pub fn list_recovery_points(
     job: &OffsiteReplicationJob,
 ) -> Result<Vec<OffsiteRecoveryPoint>, Error> {
-    let mut candidates = Vec::new();
+    let mut candidates: Vec<(Vec<String>, OffsiteRecoveryPoint)> = Vec::new();
     let mut target_snapshots = Vec::new();
     let mut points = Vec::new();
     for run in load_history(&job.id)?.runs.into_iter().rev() {
@@ -1063,21 +2068,26 @@ pub fn list_recovery_points(
             continue;
         }
 
-        let target_snapshot = match source_snapshot_to_target_snapshot(job, &snapshot) {
+        let target_snapshot_candidates = match source_snapshot_to_target_snapshot_candidates(
+            job, &snapshot,
+        ) {
             Ok(target_snapshot) => target_snapshot,
             Err(err) => {
                 log::warn!(
-                    "off-site replication: could not map recovery snapshot '{}' for job '{}': {err}",
-                    snapshot,
-                    job.id
-                );
+                        "off-site replication: could not map recovery snapshot '{}' for job '{}': {err}",
+                        snapshot,
+                        job.id
+                    );
                 continue;
             }
         };
+        if target_snapshot_candidates.is_empty() {
+            continue;
+        }
 
-        target_snapshots.push(target_snapshot.clone());
+        target_snapshots.extend(target_snapshot_candidates.iter().cloned());
         candidates.push((
-            target_snapshot,
+            target_snapshot_candidates,
             OffsiteRecoveryPoint {
                 snapshot,
                 end_time: run.end_time,
@@ -1089,20 +2099,85 @@ pub fn list_recovery_points(
     }
 
     let existing_snapshots = list_existing_target_snapshots(job, &target_snapshots)?;
-    for (target_snapshot, point) in candidates {
-        if existing_snapshots.contains(&target_snapshot) {
+    for (target_snapshot_candidates, point) in candidates {
+        if target_snapshot_candidates
+            .iter()
+            .any(|target_snapshot| existing_snapshots.contains(target_snapshot))
+        {
             points.push(point);
         } else {
+            let first_target_snapshot = target_snapshot_candidates
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "-".to_string());
             log::debug!(
                 "off-site replication: skipping stale recovery point '{}' for job '{}' (target snapshot '{}' missing)",
                 point.snapshot,
                 job.id,
-                target_snapshot
+                first_target_snapshot
             );
-            continue;
         }
     }
     Ok(points)
+}
+
+pub fn delete_recovery_point(
+    job: &OffsiteReplicationJob,
+    source_snapshot: &str,
+) -> Result<(), Error> {
+    let recoverable_points = list_recovery_points(job)?;
+    let recoverable = recoverable_points
+        .iter()
+        .any(|point| point.snapshot == source_snapshot);
+    if !recoverable {
+        bail!(
+            "snapshot '{}' is not currently recoverable on target '{}'",
+            source_snapshot,
+            job.target_dataset
+        );
+    }
+
+    let candidates = source_snapshot_to_target_snapshot_candidates(job, source_snapshot)?;
+    let existing = list_existing_target_snapshots(job, &candidates)?;
+    let to_destroy: Vec<String> = candidates
+        .into_iter()
+        .filter(|snapshot| existing.contains(snapshot))
+        .collect();
+    if to_destroy.is_empty() {
+        bail!(
+            "snapshot '{}' is no longer present on target '{}'",
+            source_snapshot,
+            job.target_dataset
+        );
+    }
+
+    let mut script = String::from("set -eu\n");
+    for target_snapshot in &to_destroy {
+        script.push_str("zfs destroy -R ");
+        script.push_str(&shell_escape(target_snapshot));
+        script.push('\n');
+    }
+    run_ssh_script_checked(
+        &job.target_remote,
+        &job.target_node,
+        &job.target_user,
+        &job.ssh_private_key,
+        &script,
+    )?;
+
+    let config_path = recovery_config_path(&job.id, source_snapshot);
+    if let Err(err) = std::fs::remove_file(&config_path) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to remove recovery config '{}' after snapshot deletion",
+                    config_path.display()
+                )
+            });
+        }
+    }
+
+    Ok(())
 }
 
 fn due_now(job: &OffsiteReplicationJob) -> bool {
@@ -1232,6 +2307,13 @@ pub fn to_status(job: OffsiteReplicationJob) -> OffsiteReplicationJobStatus {
 }
 
 pub fn run_job_now(job: OffsiteReplicationJob, auth_id: &Authid) -> Result<String, Error> {
+    if job.source_user != "root" {
+        bail!(
+            "job '{}' is invalid: source_user must be 'root' for VMID-based replication (current pve-zsync backend requirement)",
+            job.id
+        );
+    }
+
     let mut state = Job::new(WORKER_TYPE, &job.id)?;
     let worker_id = Some(job.id.clone());
     let auth_id = auth_id.to_string();
@@ -1353,6 +2435,7 @@ pub fn run_due_jobs() -> Result<(), Error> {
 mod tests {
     use super::*;
     use pdm_api_types::resource::GuestType;
+    use pdm_api_types::OffsiteZfsStreamMode;
 
     fn sample_job(guest_type: GuestType) -> OffsiteReplicationJob {
         OffsiteReplicationJob {
@@ -1368,6 +2451,7 @@ mod tests {
             max_snapshots: 8,
             history_limit: 200,
             rate_limit_mib: Some(64),
+            zfs_stream_mode: OffsiteZfsStreamMode::Auto,
             source_user: "root".to_string(),
             target_user: "root".to_string(),
             ssh_private_key: "/root/.ssh/id_ed25519".to_string(),
@@ -1517,6 +2601,7 @@ mod tests {
                 "name: app01\n",
                 "net0: virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0\n",
                 "virtio0: local-zfs:vm-100-disk-0,cache=writeback,size=32G\n",
+                "unused0: local-zfs:vm-100-disk-0\n",
                 "ide2: local-zfs:cloudinit\n",
             ),
             100,
@@ -1552,6 +2637,138 @@ mod tests {
         assert_eq!(
             recovery_storage_id("job with very long id/that-needs-sanitizing"),
             "offsite-job_with_very_long_id_t"
+        );
+    }
+
+    #[test]
+    fn test_source_snapshot_candidates_include_direct_target_snapshot() {
+        let job = OffsiteReplicationJob {
+            id: "job-100".to_string(),
+            disable: false,
+            source_remote: "src".to_string(),
+            source_node: "node-a".to_string(),
+            guest_type: pdm_api_types::resource::GuestType::Qemu,
+            vmid: 100,
+            target_remote: "dst".to_string(),
+            target_node: "node-b".to_string(),
+            target_dataset: "offsite/replica".to_string(),
+            schedule: "*:0/5".to_string(),
+            max_snapshots: 4,
+            history_limit: 200,
+            rate_limit_mib: None,
+            source_user: "root".to_string(),
+            target_user: "root".to_string(),
+            ssh_private_key: "/root/.ssh/id_ed25519".to_string(),
+            qga_fsfreeze: false,
+            comment: None,
+            zfs_stream_mode: OffsiteZfsStreamMode::Auto,
+        };
+
+        let snapshot =
+            "offsite/replica/tank__vmdata__vm-100-disk-0@rep_job-100_2026-04-16_12:00:00";
+        let candidates = source_snapshot_to_target_snapshot_candidates(&job, snapshot)
+            .expect("candidate derivation should succeed");
+        assert_eq!(
+            candidates.first().map(String::as_str),
+            Some(snapshot),
+            "exact target snapshot should be preferred first"
+        );
+    }
+
+    #[test]
+    fn test_selected_lineage_prefix_for_encoded_target_snapshot() {
+        let job = OffsiteReplicationJob {
+            id: "job-100".to_string(),
+            disable: false,
+            source_remote: "src".to_string(),
+            source_node: "node-a".to_string(),
+            guest_type: pdm_api_types::resource::GuestType::Qemu,
+            vmid: 100,
+            target_remote: "dst".to_string(),
+            target_node: "node-b".to_string(),
+            target_dataset: "offsite/replica".to_string(),
+            schedule: "*:0/5".to_string(),
+            max_snapshots: 4,
+            history_limit: 200,
+            rate_limit_mib: None,
+            source_user: "root".to_string(),
+            target_user: "root".to_string(),
+            ssh_private_key: "/root/.ssh/id_ed25519".to_string(),
+            qga_fsfreeze: false,
+            comment: None,
+            zfs_stream_mode: OffsiteZfsStreamMode::Auto,
+        };
+
+        let prefix = selected_lineage_prefix_from_target_snapshot(
+            &job,
+            "offsite/replica/tank__vmdata__vm-100-disk-0@rep_job-100_2026-04-16_12:00:00",
+        );
+        assert_eq!(prefix.as_deref(), Some("tank__vmdata"));
+    }
+
+    #[test]
+    fn test_build_qemu_failover_script_handles_duplicate_source_basenames() {
+        let job = OffsiteReplicationJob {
+            id: "job-dup".to_string(),
+            disable: false,
+            source_remote: "src".to_string(),
+            source_node: "node-a".to_string(),
+            guest_type: pdm_api_types::resource::GuestType::Qemu,
+            vmid: 100,
+            target_remote: "dst".to_string(),
+            target_node: "node-b".to_string(),
+            target_dataset: "offsite/replica".to_string(),
+            schedule: "*:0/5".to_string(),
+            max_snapshots: 4,
+            history_limit: 200,
+            rate_limit_mib: None,
+            source_user: "root".to_string(),
+            target_user: "root".to_string(),
+            ssh_private_key: "/root/.ssh/id_ed25519".to_string(),
+            qga_fsfreeze: false,
+            comment: None,
+            zfs_stream_mode: OffsiteZfsStreamMode::Auto,
+        };
+        let request = OffsiteFailoverRequest {
+            snapshot: "tank/vmdata/vm-100-disk-0@rep_job-dup_2026-04-17_00:33:06".to_string(),
+            recovery_vmid: 500,
+            recovered_name: Some("vm100-dr".to_string()),
+            start_guest: false,
+        };
+        let parsed = parse_qemu_config(
+            concat!(
+                "name: vm100\n",
+                "scsi0: lab-zfs:vm-100-disk-0,size=4G\n",
+                "scsi1: encpool:vm-100-disk-0,size=1G\n",
+            ),
+            100,
+        )
+        .expect("config should parse");
+
+        let script = build_qemu_failover_script(
+            &job,
+            &request,
+            &parsed,
+            "offsite-job-dup",
+            Some("tank__vmdata"),
+        )
+        .expect("script should build");
+
+        assert!(
+            script.contains("offsite/replica/vm-500-disk-0-scsi0"),
+            "first duplicate disk should use deterministic key suffix"
+        );
+        assert!(
+            script.contains("offsite/replica/vm-500-disk-0-scsi1"),
+            "second duplicate disk should use deterministic key suffix"
+        );
+        assert!(
+            script.contains("resolve_recovery_snapshot 'vm-100-disk-0' 1 ''"),
+            "first duplicate disk should resolve first matching snapshot"
+        );
+        assert!(
+            script.contains("resolve_recovery_snapshot 'vm-100-disk-0' 2 ''"),
+            "second duplicate disk should resolve second matching snapshot"
         );
     }
 }
