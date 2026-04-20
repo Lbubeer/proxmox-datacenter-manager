@@ -185,6 +185,8 @@ fn create_job(
         bail!("job '{}' already exists", job.id);
     }
 
+    // A recreated job id should start with a clean local history/config state.
+    crate::offsite_replication::remove_job_local_artifacts(&job.id)?;
     config.jobs.push(job.clone());
     pdm_config::offsite_replication::save_config(&config)?;
     crate::offsite_replication::ensure_job_state(&job.id)?;
@@ -301,6 +303,11 @@ fn update_job(
                 type: ConfigDigest,
                 optional: true,
             },
+            "purge-target-snapshots": {
+                type: bool,
+                optional: true,
+                description: "Also remove recorded target snapshots for this job.",
+            },
         },
     },
     access: {
@@ -311,6 +318,7 @@ fn update_job(
 fn delete_job(
     id: String,
     digest: Option<ConfigDigest>,
+    purge_target_snapshots: Option<bool>,
     rpcenv: &mut dyn RpcEnvironment,
 ) -> Result<(), Error> {
     let _lock = pdm_config::offsite_replication::lock_config()?;
@@ -323,10 +331,14 @@ fn delete_job(
     check_source_guest_privs(rpcenv, &job, PRIV_RESOURCE_MANAGE)?;
     check_target_remote_privs(rpcenv, &job.target_remote, PRIV_RESOURCE_MANAGE)?;
 
+    if purge_target_snapshots.unwrap_or(false) {
+        crate::offsite_replication::purge_target_snapshots_for_job(&job)?;
+    }
+
     config.jobs.retain(|job| job.id != id);
 
     pdm_config::offsite_replication::save_config(&config)?;
-    crate::offsite_replication::remove_job_state(&id)?;
+    crate::offsite_replication::remove_job_local_artifacts(&id)?;
     Ok(())
 }
 

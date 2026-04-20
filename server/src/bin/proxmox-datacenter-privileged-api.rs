@@ -308,10 +308,11 @@ async fn run_task_scheduler() {
 }
 
 async fn schedule_tasks() -> Result<(), Error> {
-    // TODO: move out to own module, refactor PBS stuff for reuse & then add:
-    // - task log rotation
-    // - stats (rrd) collection
-    // - ...?
+    // Off-site replication scheduling runs in the privileged daemon so it continues
+    // regardless of any browser/UI state.
+    if let Err(err) = server::offsite_replication::run_due_jobs() {
+        log::error!("off-site replication scheduler tick failed: {err}");
+    }
 
     Ok(())
 }

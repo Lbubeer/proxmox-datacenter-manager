@@ -65,6 +65,12 @@ fn history_path(job_id: &str) -> std::path::PathBuf {
     path
 }
 
+fn recovery_config_dir_for_job(job_id: &str) -> std::path::PathBuf {
+    let mut path = std::path::PathBuf::from(RECOVERY_CONFIG_DIR);
+    path.push(sanitize_id(job_id));
+    path
+}
+
 fn ensure_history_dir() -> Result<(), Error> {
     let mode = nix::sys::stat::Mode::from_bits_truncate(0o0750);
     let opts = proxmox_product_config::default_create_options().perm(mode);
@@ -80,8 +86,7 @@ fn ensure_recovery_config_dir() -> Result<(), Error> {
 }
 
 fn recovery_config_path(job_id: &str, snapshot: &str) -> std::path::PathBuf {
-    let mut path = std::path::PathBuf::from(RECOVERY_CONFIG_DIR);
-    path.push(sanitize_id(job_id));
+    let mut path = recovery_config_dir_for_job(job_id);
     path.push(format!("{}.conf", sanitize_id(snapshot)));
     path
 }
@@ -599,6 +604,79 @@ fn list_existing_target_snapshots(
         .collect())
 }
 
+fn list_recorded_target_snapshots(job: &OffsiteReplicationJob) -> Result<Vec<String>, Error> {
+    let mut snapshots = HashSet::new();
+
+    for run in load_history(&job.id)?.runs {
+        let Some(source_snapshot) = run.snapshot.as_deref() else {
+            continue;
+        };
+
+        if let Ok(target_snapshot) = source_snapshot_to_target_snapshot(job, source_snapshot) {
+            snapshots.insert(target_snapshot);
+        }
+    }
+
+    let mut snapshots: Vec<String> = snapshots.into_iter().collect();
+    snapshots.sort();
+    Ok(snapshots)
+}
+
+pub fn purge_target_snapshots_for_job(job: &OffsiteReplicationJob) -> Result<(), Error> {
+    let snapshots = list_recorded_target_snapshots(job)?;
+    if snapshots.is_empty() {
+        return Ok(());
+    }
+
+    let mut script = String::from("set -eu\n");
+    for snapshot in snapshots {
+        script.push_str("if zfs list -H -o name ");
+        script.push_str(&shell_escape(&snapshot));
+        script.push_str(" >/dev/null 2>&1; then\n");
+        script.push_str("  zfs destroy -R ");
+        script.push_str(&shell_escape(&snapshot));
+        script.push_str("\nfi\n");
+    }
+
+    run_ssh_script_checked(
+        &job.target_remote,
+        &job.target_node,
+        &job.target_user,
+        &job.ssh_private_key,
+        &script,
+    )?;
+
+    Ok(())
+}
+
+fn remove_local_job_artifacts(job_id: &str) -> Result<(), Error> {
+    let history_file = history_path(job_id);
+    if let Err(err) = std::fs::remove_file(&history_file) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to remove off-site replication history file '{}'",
+                    history_file.display()
+                )
+            });
+        }
+    }
+
+    let recovery_dir = recovery_config_dir_for_job(job_id);
+    if let Err(err) = std::fs::remove_dir_all(&recovery_dir) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to remove off-site recovery config directory '{}'",
+                    recovery_dir.display()
+                )
+            });
+        }
+    }
+
+    Ok(())
+}
+
 fn ensure_recovery_snapshot_available(
     job: &OffsiteReplicationJob,
     source_snapshot: &str,
@@ -797,7 +875,7 @@ fn build_remote_script(job: &OffsiteReplicationJob, target_host: &str) -> String
 
     if job.qga_fsfreeze && matches!(job.guest_type, pdm_api_types::resource::GuestType::Qemu) {
         script.push_str(&format!(
-            "if command -v qm >/dev/null 2>&1; then\n  qm guest cmd {} fsfreeze-freeze >/dev/null 2>&1 && FREEZE_DONE=1 || true\nfi\n",
+            "if command -v qm >/dev/null 2>&1; then\n  if qm guest cmd {} fsfreeze-freeze >/dev/null 2>&1; then\n    FREEZE_DONE=1\n    echo \"QGA fsfreeze: freeze ok\"\n  else\n    echo \"QGA fsfreeze: freeze skipped\"\n  fi\nelse\n  echo \"QGA fsfreeze: qm command unavailable\"\nfi\n",
             job.vmid
         ));
     }
@@ -820,12 +898,29 @@ fn build_remote_script(job: &OffsiteReplicationJob, target_host: &str) -> String
 
     script.push_str("STATUS=0\n");
     script.push_str(&format!("{cmd} || STATUS=$?\n"));
-    script.push_str("if [ \"$FREEZE_DONE\" = \"1\" ]; then\n  qm guest cmd ");
+    script.push_str("if [ \"$FREEZE_DONE\" = \"1\" ]; then\n  if qm guest cmd ");
     script.push_str(&format!("{}", job.vmid));
-    script.push_str(" fsfreeze-thaw >/dev/null 2>&1 || true\nfi\n");
+    script.push_str(" fsfreeze-thaw >/dev/null 2>&1; then\n    echo \"QGA fsfreeze: thaw ok\"\n  else\n    echo \"QGA fsfreeze: thaw failed\"\n  fi\nfi\n");
     script.push_str("exit \"$STATUS\"\n");
 
     script
+}
+
+fn run_option_summary(job: &OffsiteReplicationJob) -> String {
+    let rate_limit = job
+        .rate_limit_mib
+        .map(|limit| format!("{limit} MiB/s"))
+        .unwrap_or_else(|| "unlimited".to_string());
+    let qga_mode = match (job.qga_fsfreeze, job.guest_type) {
+        (true, pdm_api_types::resource::GuestType::Qemu) => "requested",
+        (false, pdm_api_types::resource::GuestType::Qemu) => "disabled",
+        (true, pdm_api_types::resource::GuestType::Lxc) => "ignored (non-qemu guest)",
+        (false, pdm_api_types::resource::GuestType::Lxc) => "not-applicable",
+    };
+    format!(
+        "INFO: options rate-limit={rate_limit}, qga-fsfreeze={qga_mode}, max-snapshots={}, history-limit={}",
+        job.max_snapshots, job.history_limit
+    )
 }
 
 fn run_over_ssh(job: &OffsiteReplicationJob) -> Result<(TaskState, String), Error> {
@@ -843,6 +938,11 @@ fn run_over_ssh(job: &OffsiteReplicationJob) -> Result<(TaskState, String), Erro
         &script,
     )?;
     let mut merged = merge_command_output(&output);
+    if !merged.trim().is_empty() {
+        merged.push('\n');
+    }
+    merged.push_str(&run_option_summary(job));
+    merged.push('\n');
 
     let duration = start.elapsed().as_secs() as i64;
     let endtime = proxmox_time::epoch_i64();
@@ -1056,6 +1156,12 @@ pub fn remove_job_state(job_id: &str) -> Result<(), Error> {
     jobstate::remove_state_file(WORKER_TYPE, job_id)
 }
 
+pub fn remove_job_local_artifacts(job_id: &str) -> Result<(), Error> {
+    remove_job_state(job_id)?;
+    remove_local_job_artifacts(job_id)?;
+    Ok(())
+}
+
 pub fn runtime_status(job: &OffsiteReplicationJob) -> OffsiteReplicationRuntimeStatus {
     let state = JobState::load(WORKER_TYPE, &job.id).ok();
     let history = load_history(&job.id).ok();
@@ -1153,7 +1259,7 @@ pub fn run_job_now(job: OffsiteReplicationJob, auth_id: &Authid) -> Result<Strin
                     estimated_bytes: None,
                     transferred_bytes: None,
                     error: Some(err.to_string()),
-                    output: String::new(),
+                    output: run_option_summary(&job),
                 };
                 if let Err(history_err) = append_history(
                     &job.id,
