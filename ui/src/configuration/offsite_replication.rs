@@ -36,13 +36,13 @@ use pdm_api_types::remotes::RemoteType;
 use pdm_api_types::resource::GuestType;
 use pdm_api_types::{
     OffsiteFailoverRequest, OffsiteRecoveryPoint, OffsiteReplicationJob,
-    OffsiteReplicationJobStatus, OffsiteReplicationRun, NODE_SCHEMA,
-    OFFSITE_REPLICATION_HISTORY_LIMIT_SCHEMA, OFFSITE_REPLICATION_ID_SCHEMA,
-    OFFSITE_REPLICATION_MAXSNAP_SCHEMA, OFFSITE_REPLICATION_SCHEDULE_SCHEMA, VMID_SCHEMA,
+    OffsiteReplicationJobStatus, OffsiteReplicationRun, OFFSITE_REPLICATION_HISTORY_LIMIT_SCHEMA,
+    OFFSITE_REPLICATION_ID_SCHEMA, OFFSITE_REPLICATION_MAXSNAP_SCHEMA,
+    OFFSITE_REPLICATION_SCHEDULE_SCHEMA,
 };
 
 use crate::renderer::status_row;
-use crate::widget::RemoteSelector;
+use crate::widget::{PveGuestSelector, PveNodeSelector, RemoteSelector};
 
 const BASE_URL: &str = "/config/offsite-replication";
 const FAILOVER_VMID_OFFSET: u32 = 400;
@@ -52,6 +52,13 @@ const TAB_FAILOVER: &str = "failover";
 const HISTORY_PAGE_SIZE: usize = 200;
 const HISTORY_GRAPH_POINTS: usize = 6;
 const AUTO_REFRESH_MS: u32 = 30_000;
+const DEFAULT_JOB_SCHEDULE: &str = "*:0/5";
+const DEFAULT_MAX_SNAPSHOTS: &str = "4";
+const DEFAULT_HISTORY_LIMIT: &str = "200";
+const DEFAULT_TARGET_DATASET: &str = "offsite/replica";
+const DEFAULT_SOURCE_USER: &str = "root";
+const DEFAULT_TARGET_USER: &str = "root";
+const DEFAULT_SSH_PRIVATE_KEY: &str = "/root/.ssh/pdm-offsite";
 const RATE_LIMIT_MIB_SCHEMA: proxmox_schema::Schema =
     IntegerSchema::new("Bandwidth limit (MiB/s).")
         .minimum(1)
@@ -94,7 +101,8 @@ enum JobPickerTarget {
 pub enum Msg {
     LoadFinished(Vec<OffsiteReplicationJobStatus>),
     MainTabChanged,
-    Remove(Key),
+    Remove(Key, bool),
+    RemovePurgeChanged(bool),
     Reload,
     RunNowActive,
     RunNowById(String),
@@ -221,6 +229,7 @@ pub struct OffsiteReplicationPanelComp {
     job_picker_store: Store<OffsiteReplicationJobStatus>,
     job_picker_selection: Selection,
     job_picker_columns: Rc<Vec<DataTableHeader<OffsiteReplicationJobStatus>>>,
+    remove_purge_target_snapshots: bool,
     auto_refresh_timer: Option<Timeout>,
 }
 
@@ -1118,6 +1127,7 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
             }),
             job_picker_selection,
             job_picker_columns: Self::job_picker_columns(),
+            remove_purge_target_snapshots: false,
             auto_refresh_timer: None,
         };
         ctx.link().send_message(Msg::ScheduleAutoRefresh);
@@ -1202,13 +1212,23 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                 ctx.link().change_view(None);
                 ctx.link().send_reload();
             }
-            Msg::Remove(key) => {
+            Msg::RemovePurgeChanged(value) => {
+                self.remove_purge_target_snapshots = value;
+            }
+            Msg::Remove(key, purge_target_snapshots) => {
                 if let Some(rec) = self.store.read().lookup_record(&key) {
                     let id = rec.job.id.clone();
                     let link = ctx.link().clone();
                     ctx.link().spawn(async move {
                         let path = format!("{BASE_URL}/{}", percent_encode_component(&id));
-                        if let Err(err) = http_delete(path, None::<Value>).await {
+                        let body = if purge_target_snapshots {
+                            Some(serde_json::json!({
+                                "purge-target-snapshots": true,
+                            }))
+                        } else {
+                            None
+                        };
+                        if let Err(err) = http_delete(path, body).await {
                             link.show_error(
                                 tr!("Error"),
                                 tr!("Could not remove job '{0}': {1}", id, err),
@@ -1218,6 +1238,7 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                         link.send_message(Msg::Reload);
                     });
                 }
+                self.remove_purge_target_snapshots = false;
             }
             Msg::RunNowActive => {
                 if let Some(id) = self.active_run_job_id() {
@@ -1258,10 +1279,7 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                 match result {
                     Ok(upid) => {
                         self.run_now_last_task = Some(upid.clone());
-                        self.run_now_feedback = Some(RunNowFeedback {
-                            job_id: id,
-                            upid,
-                        });
+                        self.run_now_feedback = Some(RunNowFeedback { job_id: id, upid });
                     }
                     Err(err) => {
                         self.run_now_feedback = None;
@@ -1738,18 +1756,13 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                         Panel::new()
                             .border(false)
                             .title(tr!("Overview"))
-                            .with_optional_child(
-                                (!jobs.is_empty()).then(|| render_jobs_overview(&jobs)),
-                            )
+                            .with_child(render_jobs_overview(&jobs))
                             .with_optional_child(self.run_now_last_task.as_ref().map(|task| {
                                 html! {
                                     <div style="padding: 0 12px 10px; opacity: 0.82;">
                                         {format!("{}: {task}", tr!("Last Run Now task"))}
                                     </div>
                                 }
-                            }))
-                            .with_optional_child(jobs.is_empty().then(|| {
-                                html! { <div style="padding: 0 12px 10px; opacity: 0.82;">{tr!("No off-site replication jobs configured.")}</div> }
                             })),
                     )
                     .with_child(
@@ -2428,8 +2441,7 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                                     Button::new(tr!("Dismiss"))
                                         .icon_class("fa fa-times")
                                         .on_activate(
-                                            ctx.link()
-                                                .callback(|_| Msg::DismissRunNowFeedback),
+                                            ctx.link().callback(|_| Msg::DismissRunNowFeedback),
                                         ),
                                 ),
                         ),
