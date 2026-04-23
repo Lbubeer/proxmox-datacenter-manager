@@ -2468,15 +2468,28 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                 .map(|key| self.create_edit_dialog(key, ctx)),
             ViewState::Remove => self.selected_job().map(|job| {
                 let id = job.job.id.clone();
-                ConfirmDialog::new(
-                    tr!("Confirm"),
-                    tr!("Remove off-site replication job '{0}'?", id.clone()),
-                )
-                .on_confirm({
+                let purge_target_snapshots = self.remove_purge_target_snapshots;
+
+                let content = Column::new()
+                    .gap(2)
+                    .with_child(tr!("Remove off-site replication job '{0}'?", id.clone()))
+                    .with_child(
+                        Checkbox::new()
+                            .box_label(tr!(
+                                "Also purge target snapshots recorded by this job (destructive)."
+                            ))
+                            .checked(purge_target_snapshots)
+                            .on_change(ctx.link().callback(Msg::RemovePurgeChanged)),
+                    );
+
+                let mut dialog = ConfirmDialog::default().on_confirm({
                     let link = ctx.link().clone();
-                    move |_| link.send_message(Msg::Remove(id.clone().into()))
-                })
-                .into()
+                    move |_| {
+                        link.send_message(Msg::Remove(id.clone().into(), purge_target_snapshots))
+                    }
+                });
+                dialog.set_confirm_message(content);
+                dialog.into()
             }),
             ViewState::PickHistoryJob => Some(self.create_job_picker_dialog(
                 tr!("Select Job for Metrics / History"),
@@ -2502,8 +2515,49 @@ enum InputPanelMode {
     Edit(String),
 }
 
-fn input_panel(_form_ctx: &FormContext, mode: InputPanelMode) -> Html {
+fn set_default_form_text(form_ctx: &FormContext, key: &'static str, default: &'static str) {
+    if form_ctx.read().get_field_text(key).trim().is_empty() {
+        form_ctx.write().set_field_value(key, default.into());
+    }
+}
+
+fn input_panel(form_ctx: &FormContext, mode: InputPanelMode) -> Html {
     let guest_types = Rc::new(vec!["qemu".into(), "lxc".into()]);
+    let is_create = matches!(mode, InputPanelMode::Create);
+
+    if is_create {
+        set_default_form_text(form_ctx, "guest-type", "qemu");
+        set_default_form_text(form_ctx, "target-dataset", DEFAULT_TARGET_DATASET);
+        set_default_form_text(form_ctx, "schedule", DEFAULT_JOB_SCHEDULE);
+        set_default_form_text(form_ctx, "max-snapshots", DEFAULT_MAX_SNAPSHOTS);
+        set_default_form_text(form_ctx, "history-limit", DEFAULT_HISTORY_LIMIT);
+        set_default_form_text(form_ctx, "source-user", DEFAULT_SOURCE_USER);
+        set_default_form_text(form_ctx, "target-user", DEFAULT_TARGET_USER);
+        set_default_form_text(form_ctx, "ssh-private-key", DEFAULT_SSH_PRIVATE_KEY);
+    }
+
+    let source_remote = form_ctx.read().get_field_text("source-remote");
+    let source_node = form_ctx.read().get_field_text("source-node");
+    let guest_type = form_ctx.read().get_field_text("guest-type");
+    let target_remote = form_ctx.read().get_field_text("target-remote");
+    let show_advanced = if is_create {
+        form_ctx.read().get_field_checked("show-advanced")
+    } else {
+        true
+    };
+
+    let source_remote_value: yew::AttrValue = source_remote.clone().into();
+    let source_node_value = if source_node.trim().is_empty() {
+        None
+    } else {
+        Some(yew::AttrValue::from(source_node.clone()))
+    };
+    let target_remote_value: yew::AttrValue = target_remote.clone().into();
+    let guest_type_value: yew::AttrValue = if guest_type.trim().is_empty() {
+        "qemu".into()
+    } else {
+        guest_type.clone().into()
+    };
 
     let mut panel = InputPanel::new().padding(4);
 
@@ -2520,20 +2574,28 @@ fn input_panel(_form_ctx: &FormContext, mode: InputPanelMode) -> Html {
         }
     }
 
-    panel
+    panel = panel
         .with_field(
             tr!("Source Remote"),
             RemoteSelector::new()
                 .name("source-remote")
                 .remote_type(RemoteType::Pve)
+                .on_change({
+                    let form_ctx = form_ctx.clone();
+                    move |_| {
+                        let mut form = form_ctx.write();
+                        form.set_field_value("source-node", Value::Null);
+                        form.set_field_value("vmid", Value::Null);
+                    }
+                })
                 .required(true),
         )
         .with_field(
             tr!("Source Node"),
-            Field::new()
+            PveNodeSelector::new(source_remote_value.clone())
                 .name("source-node")
-                .schema(&NODE_SCHEMA)
-                .required(true),
+                .required(true)
+                .disabled(source_remote.trim().is_empty()),
         )
         .with_field(
             tr!("Guest Type"),
@@ -2541,28 +2603,58 @@ fn input_panel(_form_ctx: &FormContext, mode: InputPanelMode) -> Html {
                 .name("guest-type")
                 .required(true)
                 .editable(false)
-                .items(guest_types),
+                .items(guest_types)
+                .on_change({
+                    let form_ctx = form_ctx.clone();
+                    move |_| {
+                        form_ctx.write().set_field_value("vmid", Value::Null);
+                    }
+                }),
         )
         .with_field(
-            tr!("VMID"),
-            Field::new()
+            tr!("Source Guest (VMID)"),
+            PveGuestSelector::new(source_remote_value)
                 .name("vmid")
-                .schema(&VMID_SCHEMA)
-                .required(true),
+                .node(source_node_value)
+                .guest_type(guest_type_value)
+                .required(true)
+                .disabled(source_remote.trim().is_empty() || source_node.trim().is_empty())
+                .on_change({
+                    let form_ctx = form_ctx.clone();
+                    let create_auto_id = is_create;
+                    move |value: Option<yew::AttrValue>| {
+                        if !create_auto_id {
+                            return;
+                        }
+                        let Some(vmid) = value.map(|value| value.to_string()) else {
+                            return;
+                        };
+                        let mut form = form_ctx.write();
+                        if form.get_field_text("id").trim().is_empty() {
+                            form.set_field_value("id", format!("job-{vmid}").into());
+                        }
+                    }
+                }),
         )
         .with_field(
             tr!("Target Remote"),
             RemoteSelector::new()
                 .name("target-remote")
                 .remote_type(RemoteType::Pve)
+                .on_change({
+                    let form_ctx = form_ctx.clone();
+                    move |_| {
+                        form_ctx.write().set_field_value("target-node", Value::Null);
+                    }
+                })
                 .required(true),
         )
         .with_field(
             tr!("Target Node"),
-            Field::new()
+            PveNodeSelector::new(target_remote_value)
                 .name("target-node")
-                .schema(&NODE_SCHEMA)
-                .required(true),
+                .required(true)
+                .disabled(target_remote.trim().is_empty()),
         )
         .with_field(
             tr!("Target Dataset"),
@@ -2588,41 +2680,58 @@ fn input_panel(_form_ctx: &FormContext, mode: InputPanelMode) -> Html {
                 .name("history-limit")
                 .schema(&OFFSITE_REPLICATION_HISTORY_LIMIT_SCHEMA)
                 .required(true),
-        )
-        .with_field(
-            tr!("Rate Limit (MiB/s)"),
-            Field::new()
-                .name("rate-limit-mib")
-                .schema(&RATE_LIMIT_MIB_SCHEMA),
-        )
-        .with_field(
-            tr!("Source SSH User"),
-            Field::new().name("source-user").required(true),
-        )
-        .with_field(
-            tr!("Target SSH User"),
-            Field::new().name("target-user").required(true),
-        )
-        .with_field(
-            tr!("SSH Private Key"),
-            Field::new().name("ssh-private-key").required(true),
-        )
-        .with_large_field(
-            tr!("QEMU Guest Agent Freeze"),
+        );
+
+    if is_create {
+        panel = panel.with_large_field(
+            tr!("Advanced Options"),
             Checkbox::new()
-                .name("qga-fsfreeze")
+                .name("show-advanced")
                 .default(false)
-                .box_label(tr!("Try fsfreeze/thaw around sync for QEMU guests.")),
-        )
-        .with_large_field(
-            tr!("Disable Job"),
-            Checkbox::new()
-                .name("disable")
-                .default(false)
-                .box_label(tr!("Disable scheduling for this job.")),
-        )
-        .with_large_field(tr!("Comment"), Field::new().name("comment"))
-        .into()
+                .box_label(tr!(
+                    "Show advanced settings (rate limit, SSH, guest agent freeze)."
+                )),
+        );
+    }
+
+    if show_advanced {
+        panel = panel
+            .with_field(
+                tr!("Rate Limit (MiB/s)"),
+                Field::new()
+                    .name("rate-limit-mib")
+                    .schema(&RATE_LIMIT_MIB_SCHEMA),
+            )
+            .with_field(
+                tr!("Source SSH User"),
+                Field::new().name("source-user").required(true),
+            )
+            .with_field(
+                tr!("Target SSH User"),
+                Field::new().name("target-user").required(true),
+            )
+            .with_field(
+                tr!("SSH Private Key"),
+                Field::new().name("ssh-private-key").required(true),
+            )
+            .with_large_field(
+                tr!("QEMU Guest Agent Freeze"),
+                Checkbox::new()
+                    .name("qga-fsfreeze")
+                    .default(false)
+                    .box_label(tr!("Try fsfreeze/thaw around sync for QEMU guests.")),
+            )
+            .with_large_field(
+                tr!("Disable Job"),
+                Checkbox::new()
+                    .name("disable")
+                    .default(false)
+                    .box_label(tr!("Disable scheduling for this job.")),
+            )
+            .with_large_field(tr!("Comment"), Field::new().name("comment"));
+    }
+
+    panel.into()
 }
 
 fn normalize_u32_field(data: &mut Value, key: &str) -> Result<(), Error> {
@@ -2681,6 +2790,24 @@ fn normalize_job_form_aliases(data: &mut Value) {
     }
 }
 
+fn ensure_job_form_default(data: &mut Value, key: &str, default: &str) {
+    let needs_default = data
+        .get(key)
+        .and_then(Value::as_str)
+        .map(|value| value.trim().is_empty())
+        .unwrap_or(true);
+
+    if needs_default {
+        data[key] = Value::from(default);
+    }
+}
+
+fn ensure_job_form_bool(data: &mut Value, key: &str, default: bool) {
+    if data.get(key).and_then(Value::as_bool).is_none() {
+        data[key] = Value::from(default);
+    }
+}
+
 fn parse_job_form(
     form_ctx: FormContext,
     fallback_id: Option<&str>,
@@ -2688,6 +2815,31 @@ fn parse_job_form(
     let data = form_ctx.get_submit_data();
     let mut data = delete_empty_values(&data, &["rate-limit-mib", "comment"], true);
     normalize_job_form_aliases(&mut data);
+
+    ensure_job_form_default(&mut data, "schedule", DEFAULT_JOB_SCHEDULE);
+    ensure_job_form_default(&mut data, "max-snapshots", DEFAULT_MAX_SNAPSHOTS);
+    ensure_job_form_default(&mut data, "history-limit", DEFAULT_HISTORY_LIMIT);
+    ensure_job_form_default(&mut data, "target-dataset", DEFAULT_TARGET_DATASET);
+    ensure_job_form_default(&mut data, "source-user", DEFAULT_SOURCE_USER);
+    ensure_job_form_default(&mut data, "target-user", DEFAULT_TARGET_USER);
+    ensure_job_form_default(&mut data, "ssh-private-key", DEFAULT_SSH_PRIVATE_KEY);
+    ensure_job_form_bool(&mut data, "qga-fsfreeze", false);
+    ensure_job_form_bool(&mut data, "disable", false);
+
+    if data
+        .get("id")
+        .and_then(Value::as_str)
+        .map(|id| id.trim().is_empty())
+        .unwrap_or(true)
+    {
+        if let Some(vmid) = data.get("vmid").and_then(Value::as_u64).or_else(|| {
+            data.get("vmid")
+                .and_then(Value::as_str)
+                .and_then(|vmid| vmid.parse().ok())
+        }) {
+            data["id"] = Value::from(format!("job-{vmid}"));
+        }
+    }
 
     if let Some(path_id) = fallback_id {
         if let Some(submitted_id) = data.get("id").and_then(Value::as_str) {
