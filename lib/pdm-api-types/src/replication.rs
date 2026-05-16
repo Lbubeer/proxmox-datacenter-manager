@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use proxmox_schema::{api, IntegerSchema, Schema, StringSchema};
+use anyhow::{bail, Error};
+
+use proxmox_schema::{api, const_regex, ApiStringFormat, IntegerSchema, Schema, StringSchema};
 
 use crate::resource::GuestType;
 use crate::PROXMOX_SAFE_ID_FORMAT;
@@ -10,6 +12,73 @@ pub const OFFSITE_REPLICATION_ID_SCHEMA: Schema = StringSchema::new("Off-site re
     .min_length(2)
     .max_length(64)
     .schema();
+
+const_regex! {
+    /// Conservative ZFS dataset path accepted for target-side replication roots.
+    pub OFFSITE_REPLICATION_TARGET_DATASET_REGEX = r"^[A-Za-z0-9][A-Za-z0-9_.:-]*(/[A-Za-z0-9][A-Za-z0-9_.:-]*)*$";
+
+    /// SSH login name used in local SSH/scp command construction.
+    pub OFFSITE_REPLICATION_SSH_USER_REGEX = r"^[A-Za-z_][A-Za-z0-9_.-]{0,31}\$?$";
+
+    /// Absolute local private key path without shell metacharacters or whitespace.
+    pub OFFSITE_REPLICATION_SSH_KEY_PATH_REGEX = r"^/(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+$";
+
+    /// Source snapshot identifier as emitted by pve-zsync/ZFS.
+    pub OFFSITE_REPLICATION_SNAPSHOT_REGEX = r"^[A-Za-z0-9][A-Za-z0-9_.:-]*(/[A-Za-z0-9][A-Za-z0-9_.:-]*)*@[A-Za-z0-9][A-Za-z0-9_.:-]*$";
+
+    /// Conservative guest name override for recovered VMs.
+    pub OFFSITE_REPLICATION_RECOVERED_NAME_REGEX = r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$";
+}
+
+pub const OFFSITE_REPLICATION_TARGET_DATASET_FORMAT: ApiStringFormat =
+    ApiStringFormat::VerifyFn(verify_offsite_target_dataset);
+
+pub const OFFSITE_REPLICATION_SSH_USER_FORMAT: ApiStringFormat =
+    ApiStringFormat::Pattern(&OFFSITE_REPLICATION_SSH_USER_REGEX);
+
+pub const OFFSITE_REPLICATION_SSH_KEY_PATH_FORMAT: ApiStringFormat =
+    ApiStringFormat::VerifyFn(verify_offsite_ssh_key_path);
+
+pub const OFFSITE_REPLICATION_SNAPSHOT_FORMAT: ApiStringFormat =
+    ApiStringFormat::VerifyFn(verify_offsite_snapshot);
+
+pub const OFFSITE_REPLICATION_RECOVERED_NAME_FORMAT: ApiStringFormat =
+    ApiStringFormat::Pattern(&OFFSITE_REPLICATION_RECOVERED_NAME_REGEX);
+
+pub const OFFSITE_REPLICATION_TARGET_DATASET_SCHEMA: Schema =
+    StringSchema::new("Target ZFS dataset used as off-site replication root.")
+        .format(&OFFSITE_REPLICATION_TARGET_DATASET_FORMAT)
+        .min_length(1)
+        .max_length(255)
+        .schema();
+
+pub const OFFSITE_REPLICATION_SSH_USER_SCHEMA: Schema =
+    StringSchema::new("SSH login user for off-site replication.")
+        .format(&OFFSITE_REPLICATION_SSH_USER_FORMAT)
+        .min_length(1)
+        .max_length(32)
+        .schema();
+
+pub const OFFSITE_REPLICATION_SSH_KEY_PATH_SCHEMA: Schema =
+    StringSchema::new("Absolute local SSH private key path for off-site replication.")
+        .format(&OFFSITE_REPLICATION_SSH_KEY_PATH_FORMAT)
+        .min_length(2)
+        .max_length(255)
+        .schema();
+
+pub const OFFSITE_REPLICATION_SNAPSHOT_SCHEMA: Schema =
+    StringSchema::new("Source snapshot identifier for an off-site recovery point.")
+        .format(&OFFSITE_REPLICATION_SNAPSHOT_FORMAT)
+        .min_length(3)
+        .max_length(512)
+        .schema();
+
+pub const OFFSITE_REPLICATION_RECOVERED_NAME_SCHEMA: Schema =
+    StringSchema::new("Recovered guest name.")
+        .format(&OFFSITE_REPLICATION_RECOVERED_NAME_FORMAT)
+        .min_length(1)
+        .max_length(63)
+        .schema();
 
 pub const OFFSITE_REPLICATION_SCHEDULE_SCHEMA: Schema =
     StringSchema::new("Replication schedule in systemd calendar-event format.")
@@ -43,6 +112,54 @@ fn default_install_authorized_keys() -> bool {
     true
 }
 
+pub fn verify_offsite_target_dataset(dataset: &str) -> Result<(), Error> {
+    if !OFFSITE_REPLICATION_TARGET_DATASET_REGEX.is_match(dataset) {
+        bail!("invalid target dataset '{}'", dataset);
+    }
+    for component in dataset.split('/') {
+        if component == "." || component == ".." {
+            bail!("target dataset must not contain '.' or '..' components");
+        }
+    }
+    Ok(())
+}
+
+pub fn verify_offsite_ssh_user(user: &str) -> Result<(), Error> {
+    if !OFFSITE_REPLICATION_SSH_USER_REGEX.is_match(user) {
+        bail!("invalid SSH user '{}'", user);
+    }
+    Ok(())
+}
+
+pub fn verify_offsite_ssh_key_path(path: &str) -> Result<(), Error> {
+    if !OFFSITE_REPLICATION_SSH_KEY_PATH_REGEX.is_match(path) {
+        bail!("invalid SSH private key path '{}'", path);
+    }
+    for component in path.split('/').filter(|component| !component.is_empty()) {
+        if component == "." || component == ".." {
+            bail!("SSH private key path must not contain '.' or '..' components");
+        }
+    }
+    Ok(())
+}
+
+pub fn verify_offsite_snapshot(snapshot: &str) -> Result<(), Error> {
+    if !OFFSITE_REPLICATION_SNAPSHOT_REGEX.is_match(snapshot) {
+        bail!("invalid recovery snapshot '{}'", snapshot);
+    }
+    let (dataset, _) = snapshot
+        .rsplit_once('@')
+        .ok_or_else(|| anyhow::format_err!("recovery snapshot is missing '@' separator"))?;
+    verify_offsite_target_dataset(dataset)
+}
+
+pub fn verify_offsite_recovered_name(name: &str) -> Result<(), Error> {
+    if !OFFSITE_REPLICATION_RECOVERED_NAME_REGEX.is_match(name) {
+        bail!("invalid recovered guest name '{}'", name);
+    }
+    Ok(())
+}
+
 #[api]
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 /// Replication stream mode used for ZFS send/receive.
@@ -70,7 +187,15 @@ impl OffsiteZfsStreamMode {
     }
 }
 
-#[api]
+#[api(
+    properties: {
+        "id": { schema: OFFSITE_REPLICATION_ID_SCHEMA },
+        "target-dataset": { schema: OFFSITE_REPLICATION_TARGET_DATASET_SCHEMA },
+        "source-user": { schema: OFFSITE_REPLICATION_SSH_USER_SCHEMA },
+        "target-user": { schema: OFFSITE_REPLICATION_SSH_USER_SCHEMA },
+        "ssh-private-key": { schema: OFFSITE_REPLICATION_SSH_KEY_PATH_SCHEMA },
+    },
+)]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 /// Off-site replication job definition managed by PDM.
@@ -121,7 +246,14 @@ pub struct OffsiteReplicationJob {
     pub disable: bool,
 }
 
-#[api]
+#[api(
+    properties: {
+        "target-dataset": { schema: OFFSITE_REPLICATION_TARGET_DATASET_SCHEMA },
+        "source-user": { schema: OFFSITE_REPLICATION_SSH_USER_SCHEMA },
+        "target-user": { schema: OFFSITE_REPLICATION_SSH_USER_SCHEMA },
+        "ssh-private-key": { schema: OFFSITE_REPLICATION_SSH_KEY_PATH_SCHEMA },
+    },
+)]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 /// Updater payload for replacing an off-site replication job by path ID.
@@ -283,7 +415,15 @@ pub struct OffsiteRecoveryPoint {
     pub transferred_bytes: Option<u64>,
 }
 
-#[api]
+#[api(
+    properties: {
+        "snapshot": { schema: OFFSITE_REPLICATION_SNAPSHOT_SCHEMA },
+        "recovered-name": {
+            schema: OFFSITE_REPLICATION_RECOVERED_NAME_SCHEMA,
+            optional: true,
+        },
+    },
+)]
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 /// Parameters for promoting a replicated recovery point on the target remote.
@@ -300,7 +440,13 @@ pub struct OffsiteFailoverRequest {
     pub start_guest: bool,
 }
 
-#[api]
+#[api(
+    properties: {
+        "source-user": { schema: OFFSITE_REPLICATION_SSH_USER_SCHEMA },
+        "target-user": { schema: OFFSITE_REPLICATION_SSH_USER_SCHEMA },
+        "ssh-private-key": { schema: OFFSITE_REPLICATION_SSH_KEY_PATH_SCHEMA },
+    },
+)]
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 /// Parameters for SSH setup preparation for off-site replication jobs.
@@ -375,7 +521,11 @@ pub struct OffsiteSshPrepareResult {
     pub steps: Vec<OffsiteSshPrepareStep>,
 }
 
-#[api]
+#[api(
+    properties: {
+        "ssh-private-key": { schema: OFFSITE_REPLICATION_SSH_KEY_PATH_SCHEMA },
+    },
+)]
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 /// Parameters for generating an SSH keypair on the PDM host.

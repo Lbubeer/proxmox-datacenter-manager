@@ -16,6 +16,14 @@ const SUBDIRS: SubdirMap = &sorted!([
     ("certificate", &certificate::ROUTER),
     ("notes", &notes::ROUTER),
     ("offsite-replication", &offsite_replication::ROUTER),
+    (
+        "offsite-replication-ssh-keygen",
+        &offsite_replication::SSH_KEYGEN_ROUTER
+    ),
+    (
+        "offsite-replication-ssh-prepare",
+        &offsite_replication::SSH_PREPARE_ROUTER
+    ),
     ("views", &views::ROUTER)
 ]);
 

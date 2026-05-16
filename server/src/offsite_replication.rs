@@ -9,10 +9,12 @@ use proxmox_time::CalendarEvent;
 use serde::{Deserialize, Serialize};
 
 use pdm_api_types::{
-    Authid, OffsiteFailoverRequest, OffsiteRecoveryPoint, OffsiteReplicationJob,
-    OffsiteReplicationJobStatus, OffsiteReplicationRun, OffsiteReplicationRuntimeStatus,
-    OffsiteSshKeygenRequest, OffsiteSshKeygenResult, OffsiteSshPrepareRequest,
-    OffsiteSshPrepareResult, OffsiteSshPrepareStep, DEFAULT_OFFSITE_REPLICATION_HISTORY_LIMIT,
+    verify_offsite_recovered_name, verify_offsite_snapshot, verify_offsite_ssh_key_path,
+    verify_offsite_ssh_user, verify_offsite_target_dataset, Authid, OffsiteFailoverRequest,
+    OffsiteRecoveryPoint, OffsiteReplicationJob, OffsiteReplicationJobStatus,
+    OffsiteReplicationRun, OffsiteReplicationRuntimeStatus, OffsiteSshKeygenRequest,
+    OffsiteSshKeygenResult, OffsiteSshPrepareRequest, OffsiteSshPrepareResult,
+    OffsiteSshPrepareStep, DEFAULT_OFFSITE_REPLICATION_HISTORY_LIMIT, PROXMOX_SAFE_ID_REGEX,
 };
 
 use crate::jobstate::{self, Job, JobState};
@@ -600,6 +602,8 @@ fn ssh_keygen_fingerprint(public_key_path: &std::path::Path) -> Result<String, E
 pub fn generate_ssh_keypair(
     request: &OffsiteSshKeygenRequest,
 ) -> Result<OffsiteSshKeygenResult, Error> {
+    verify_offsite_ssh_key_path(&request.ssh_private_key)?;
+
     let key_path = std::path::Path::new(&request.ssh_private_key);
     if !key_path.is_absolute() {
         bail!("ssh private key path must be absolute");
@@ -794,6 +798,10 @@ fn verify_source_to_target_hop(
 }
 
 pub fn prepare_ssh(request: &OffsiteSshPrepareRequest) -> Result<OffsiteSshPrepareResult, Error> {
+    verify_offsite_ssh_user(&request.source_user)?;
+    verify_offsite_ssh_user(&request.target_user)?;
+    verify_offsite_ssh_key_path(&request.ssh_private_key)?;
+
     let (source_host, source_port) =
         resolve_node_host(&request.source_remote, &request.source_node)
             .with_context(|| "failed to resolve source node host")?;
@@ -1337,6 +1345,7 @@ fn list_recorded_target_snapshots(job: &OffsiteReplicationJob) -> Result<Vec<Str
 }
 
 pub fn purge_target_snapshots_for_job(job: &OffsiteReplicationJob) -> Result<(), Error> {
+    validate_runtime_job(job)?;
     let snapshots = list_recorded_target_snapshots(job)?;
     if snapshots.is_empty() {
         return Ok(());
@@ -1637,6 +1646,12 @@ fn execute_failover(
     job: &OffsiteReplicationJob,
     request: &OffsiteFailoverRequest,
 ) -> Result<String, Error> {
+    validate_runtime_job(job)?;
+    verify_offsite_snapshot(&request.snapshot)?;
+    if let Some(name) = request.recovered_name.as_deref() {
+        verify_offsite_recovered_name(name)?;
+    }
+
     if job.guest_type != pdm_api_types::resource::GuestType::Qemu {
         bail!("failover is currently implemented only for QEMU guests");
     }
@@ -1664,16 +1679,41 @@ fn execute_failover(
     )
 }
 
+fn validate_runtime_job(job: &OffsiteReplicationJob) -> Result<(), Error> {
+    if !PROXMOX_SAFE_ID_REGEX.is_match(&job.id) {
+        bail!("job '{}' is invalid: invalid job id", job.id);
+    }
+    verify_offsite_target_dataset(&job.target_dataset)?;
+    verify_offsite_ssh_user(&job.source_user)?;
+    verify_offsite_ssh_user(&job.target_user)?;
+    verify_offsite_ssh_key_path(&job.ssh_private_key)?;
+    if job.source_user != "root" {
+        bail!(
+            "job '{}' is invalid: source_user must be 'root' for VMID-based replication (current pve-zsync backend requirement)",
+            job.id
+        );
+    }
+    if job.max_snapshots == 0 {
+        bail!(
+            "job '{}' is invalid: max snapshots must be greater than zero",
+            job.id
+        );
+    }
+    Ok(())
+}
+
 fn build_plain_sync_command(job: &OffsiteReplicationJob, target_host: &str) -> String {
+    let source = job.vmid.to_string();
+    let dest = format!("{target_host}:{}", job.target_dataset);
+    let max_snapshots = job.max_snapshots.to_string();
     let mut cmd = format!(
-        "pve-zsync sync --source {} --dest {}:{} --name {} --maxsnap {} --method ssh --source-user {} --dest-user {} --verbose",
-        job.vmid,
-        target_host,
-        job.target_dataset,
-        job.id,
-        job.max_snapshots,
-        job.source_user,
-        job.target_user,
+        "pve-zsync sync --source {} --dest {} --name {} --maxsnap {} --method ssh --source-user {} --dest-user {} --verbose",
+        shell_escape(&source),
+        shell_escape(&dest),
+        shell_escape(&job.id),
+        shell_escape(&max_snapshots),
+        shell_escape(&job.source_user),
+        shell_escape(&job.target_user),
     );
 
     if let Some(limit_mib) = job.rate_limit_mib {
@@ -1929,6 +1969,8 @@ fn run_option_summary(job: &OffsiteReplicationJob) -> String {
 }
 
 fn run_over_ssh(job: &OffsiteReplicationJob) -> Result<(TaskState, String), Error> {
+    validate_runtime_job(job)?;
+
     let (target_host, _target_port) = resolve_node_host(&job.target_remote, &job.target_node)?;
 
     let target_host = normalize_host_for_connection(&target_host);
@@ -2054,6 +2096,8 @@ pub fn list_history(
 pub fn list_recovery_points(
     job: &OffsiteReplicationJob,
 ) -> Result<Vec<OffsiteRecoveryPoint>, Error> {
+    validate_runtime_job(job)?;
+
     let mut candidates: Vec<(Vec<String>, OffsiteRecoveryPoint)> = Vec::new();
     let mut target_snapshots = Vec::new();
     let mut points = Vec::new();
@@ -2125,6 +2169,9 @@ pub fn delete_recovery_point(
     job: &OffsiteReplicationJob,
     source_snapshot: &str,
 ) -> Result<(), Error> {
+    validate_runtime_job(job)?;
+    verify_offsite_snapshot(source_snapshot)?;
+
     let recoverable_points = list_recovery_points(job)?;
     let recoverable = recoverable_points
         .iter()
@@ -2307,12 +2354,7 @@ pub fn to_status(job: OffsiteReplicationJob) -> OffsiteReplicationJobStatus {
 }
 
 pub fn run_job_now(job: OffsiteReplicationJob, auth_id: &Authid) -> Result<String, Error> {
-    if job.source_user != "root" {
-        bail!(
-            "job '{}' is invalid: source_user must be 'root' for VMID-based replication (current pve-zsync backend requirement)",
-            job.id
-        );
-    }
+    validate_runtime_job(&job)?;
 
     let mut state = Job::new(WORKER_TYPE, &job.id)?;
     let worker_id = Some(job.id.clone());
@@ -2384,6 +2426,12 @@ pub fn run_failover_now(
     request: OffsiteFailoverRequest,
     auth_id: &Authid,
 ) -> Result<String, Error> {
+    validate_runtime_job(&job)?;
+    verify_offsite_snapshot(&request.snapshot)?;
+    if let Some(name) = request.recovered_name.as_deref() {
+        verify_offsite_recovered_name(name)?;
+    }
+
     ensure_recovery_snapshot_available(&job, &request.snapshot)?;
 
     let worker_id = Some(format!("{}-{}", job.id, request.recovery_vmid));
@@ -2475,8 +2523,9 @@ mod tests {
 
         assert!(script.contains("qm guest cmd 100 fsfreeze-freeze"));
         assert!(script.contains("qm guest cmd 100 fsfreeze-thaw"));
-        assert!(script.contains("pve-zsync sync --source 100"));
-        assert!(script.contains("--dest 192.0.2.10:tank/offsite"));
+        assert!(script.contains("pve-zsync sync --source '100'"));
+        assert!(script.contains("--dest '192.0.2.10:tank/offsite'"));
+        assert!(script.contains("--name 'job-100'"));
         assert!(script.contains("--limit 65536"));
     }
 
@@ -2487,7 +2536,21 @@ mod tests {
 
         assert!(!script.contains("fsfreeze-freeze"));
         assert!(!script.contains("fsfreeze-thaw"));
-        assert!(script.contains("pve-zsync sync --source 100"));
+        assert!(script.contains("pve-zsync sync --source '100'"));
+    }
+
+    #[test]
+    fn test_plain_sync_command_shell_escapes_fields() {
+        let mut job = sample_job(GuestType::Qemu);
+        job.id = "job'100".to_string();
+        job.target_dataset = "tank/off'site".to_string();
+        job.target_user = "root'user".to_string();
+
+        let command = build_plain_sync_command(&job, "target'host");
+
+        assert!(command.contains("--dest 'target'\"'\"'host:tank/off'\"'\"'site'"));
+        assert!(command.contains("--name 'job'\"'\"'100'"));
+        assert!(command.contains("--dest-user 'root'\"'\"'user'"));
     }
 
     #[test]

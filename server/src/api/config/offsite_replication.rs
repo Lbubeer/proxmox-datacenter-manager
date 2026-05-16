@@ -6,11 +6,14 @@ use proxmox_schema::api;
 use proxmox_sortable_macro::sortable;
 
 use pdm_api_types::{
-    Authid, ConfigDigest, OffsiteFailoverRequest, OffsiteRecoveryPoint, OffsiteReplicationJob,
+    verify_offsite_recovered_name, verify_offsite_snapshot, verify_offsite_ssh_key_path,
+    verify_offsite_ssh_user, verify_offsite_target_dataset, Authid, ConfigDigest,
+    OffsiteFailoverRequest, OffsiteRecoveryPoint, OffsiteReplicationJob,
     OffsiteReplicationJobStatus, OffsiteReplicationJobUpdater, OffsiteReplicationRun,
     OffsiteSshKeygenRequest, OffsiteSshKeygenResult, OffsiteSshPrepareRequest,
     OffsiteSshPrepareResult, OFFSITE_REPLICATION_HISTORY_LIMIT_SCHEMA,
-    OFFSITE_REPLICATION_ID_SCHEMA, PRIV_RESOURCE_AUDIT, PRIV_RESOURCE_MANAGE,
+    OFFSITE_REPLICATION_ID_SCHEMA, OFFSITE_REPLICATION_SNAPSHOT_SCHEMA, PRIV_RESOURCE_AUDIT,
+    PRIV_RESOURCE_MANAGE, PROXMOX_SAFE_ID_REGEX,
 };
 
 const ITEM_ROUTER: Router = Router::new()
@@ -47,9 +50,16 @@ fn find_job<'a>(jobs: &'a [OffsiteReplicationJob], id: &str) -> Option<&'a Offsi
 }
 
 fn validate_job(job: &OffsiteReplicationJob) -> Result<(), Error> {
+    if !PROXMOX_SAFE_ID_REGEX.is_match(&job.id) {
+        bail!("invalid job id '{}'", job.id);
+    }
     if job.source_remote == job.target_remote {
         bail!("source and target remotes must differ");
     }
+    verify_offsite_target_dataset(&job.target_dataset)?;
+    verify_offsite_ssh_user(&job.source_user)?;
+    verify_offsite_ssh_user(&job.target_user)?;
+    verify_offsite_ssh_key_path(&job.ssh_private_key)?;
     if job.source_user != "root" {
         bail!(
             "source_user must be 'root' for VMID-based replication (current pve-zsync backend requirement)"
@@ -63,6 +73,24 @@ fn validate_job(job: &OffsiteReplicationJob) -> Result<(), Error> {
     }
     if job.history_limit == 0 {
         bail!("history limit must be greater than zero");
+    }
+    Ok(())
+}
+
+fn validate_ssh_prepare_request(request: &OffsiteSshPrepareRequest) -> Result<(), Error> {
+    verify_offsite_ssh_user(&request.source_user)?;
+    verify_offsite_ssh_user(&request.target_user)?;
+    verify_offsite_ssh_key_path(&request.ssh_private_key)
+}
+
+fn validate_ssh_keygen_request(request: &OffsiteSshKeygenRequest) -> Result<(), Error> {
+    verify_offsite_ssh_key_path(&request.ssh_private_key)
+}
+
+fn validate_failover_request(request: &OffsiteFailoverRequest) -> Result<(), Error> {
+    verify_offsite_snapshot(&request.snapshot)?;
+    if let Some(name) = request.recovered_name.as_deref() {
+        verify_offsite_recovered_name(name)?;
     }
     Ok(())
 }
@@ -449,10 +477,7 @@ fn list_recovery_points(
         properties: {
             id: { schema: OFFSITE_REPLICATION_ID_SCHEMA },
             snapshot: {
-                description: "Source snapshot name for the recoverable point to delete.",
-                type: String,
-                min_length: 3,
-                max_length: 512,
+                schema: OFFSITE_REPLICATION_SNAPSHOT_SCHEMA,
             },
         },
     },
@@ -466,6 +491,7 @@ fn delete_recovery_snapshot(
     snapshot: String,
     rpcenv: &mut dyn RpcEnvironment,
 ) -> Result<(), Error> {
+    verify_offsite_snapshot(&snapshot)?;
     let (config, _) = pdm_config::offsite_replication::config()?;
     let Some(job) = find_job(&config.jobs, &id) else {
         http_bail!(NOT_FOUND, "job '{}' does not exist", id);
@@ -527,6 +553,7 @@ fn prepare_ssh(
     request: OffsiteSshPrepareRequest,
     rpcenv: &mut dyn RpcEnvironment,
 ) -> Result<OffsiteSshPrepareResult, Error> {
+    validate_ssh_prepare_request(&request)?;
     check_source_guest_privs_for(
         rpcenv,
         &request.source_remote,
@@ -558,6 +585,7 @@ fn keygen_ssh(
     request: OffsiteSshKeygenRequest,
     rpcenv: &mut dyn RpcEnvironment,
 ) -> Result<OffsiteSshKeygenResult, Error> {
+    validate_ssh_keygen_request(&request)?;
     check_source_guest_privs_for(
         rpcenv,
         &request.source_remote,
@@ -592,6 +620,7 @@ fn failover(
     request: OffsiteFailoverRequest,
     rpcenv: &mut dyn RpcEnvironment,
 ) -> Result<String, Error> {
+    validate_failover_request(&request)?;
     let (config, _) = pdm_config::offsite_replication::config()?;
     let Some(job) = find_job(&config.jobs, &id) else {
         http_bail!(NOT_FOUND, "job '{}' does not exist", id);
