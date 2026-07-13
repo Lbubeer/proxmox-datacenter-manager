@@ -336,6 +336,12 @@ pub struct OffsiteReplicationRuntimeStatus {
     /// Number of recorded failed runs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_count: Option<u64>,
+    /// Whether lifecycle handling has suspended scheduled replication.
+    #[serde(default)]
+    pub suspended: bool,
+    /// Human-readable reason for lifecycle suspension.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suspend_reason: Option<String>,
 }
 
 #[api(
@@ -395,13 +401,26 @@ pub struct OffsiteReplicationRun {
     pub output: String,
 }
 
-#[api]
+#[api(
+    properties: {
+        "target-snapshots": {
+            type: Array,
+            items: {
+                description: "Target-side snapshot name.",
+                type: String,
+            },
+        },
+    },
+)]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 /// A recovery point derived from a successful off-site replication run.
 pub struct OffsiteRecoveryPoint {
     /// Recovery snapshot identifier as recorded by the replication job.
     pub snapshot: String,
+    /// Source snapshot used as the lineage anchor, if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_snapshot: Option<String>,
     /// Completion time of the successful replication run.
     pub end_time: i64,
     /// Parsed transfer mode (`full` or `incremental`), if known.
@@ -413,6 +432,9 @@ pub struct OffsiteRecoveryPoint {
     /// Actual transferred size in bytes, if known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transferred_bytes: Option<u64>,
+    /// Candidate target-side names used to resolve this recovery point across storage layouts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_snapshots: Vec<String>,
 }
 
 #[api(
@@ -420,6 +442,10 @@ pub struct OffsiteRecoveryPoint {
         "snapshot": { schema: OFFSITE_REPLICATION_SNAPSHOT_SCHEMA },
         "recovered-name": {
             schema: OFFSITE_REPLICATION_RECOVERED_NAME_SCHEMA,
+            optional: true,
+        },
+        "start-guest": {
+            type: Boolean,
             optional: true,
         },
     },
@@ -438,6 +464,220 @@ pub struct OffsiteFailoverRequest {
     /// Start the guest after registration on the target.
     #[serde(default)]
     pub start_guest: bool,
+}
+
+#[api]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+/// Persistent lifecycle of a promoted recovery guest.
+pub enum OffsiteFailoverLifecycle {
+    /// Promotion is active and keeps the replication job suspended.
+    #[default]
+    #[serde(rename = "active")]
+    Active,
+    /// Promotion was returned successfully to the source.
+    #[serde(rename = "returned")]
+    Returned,
+    /// Operator archived a promotion that will no longer be returned.
+    #[serde(rename = "abandoned")]
+    Abandoned,
+    /// A later promotion reused the same recovery VMID.
+    #[serde(rename = "superseded")]
+    Superseded,
+}
+
+#[api]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+/// Live guest state observed during promoted-record reconciliation.
+pub enum OffsiteGuestState {
+    /// Live state has not been checked or could not be determined.
+    #[default]
+    #[serde(rename = "unknown")]
+    Unknown,
+    /// Guest is registered and running.
+    #[serde(rename = "running")]
+    Running,
+    /// Guest is registered and stopped.
+    #[serde(rename = "stopped")]
+    Stopped,
+    /// Guest is not registered on the expected node.
+    #[serde(rename = "missing")]
+    Missing,
+}
+
+#[api]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+/// Failback lineage state observed for a promoted guest.
+pub enum OffsiteFailbackLineage {
+    /// Lineage has not been checked.
+    #[default]
+    #[serde(rename = "unchecked")]
+    Unchecked,
+    /// Incremental failback can use the recorded common snapshot.
+    #[serde(rename = "incremental")]
+    Incremental,
+    /// A full transfer is required.
+    #[serde(rename = "full-required")]
+    FullRequired,
+    /// Expected promoted disks are missing or no longer match the record.
+    #[serde(rename = "diverged")]
+    Diverged,
+}
+
+#[api]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+/// Recorded failover metadata and its reconciled live state.
+pub struct OffsiteFailoverRecord {
+    /// Stable identifier for this promotion event.
+    #[serde(default)]
+    pub record_id: String,
+    /// Replication job used for the original failover.
+    pub job_id: String,
+    /// Source snapshot selected by the operator during failover.
+    pub source_snapshot: String,
+    /// Target snapshot resolved on the recovery node.
+    pub target_snapshot: String,
+    /// VMID created on the recovery target.
+    pub recovery_vmid: u32,
+    /// Name assigned to the recovered guest, if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovered_name: Option<String>,
+    /// Epoch seconds when the failover completed.
+    pub failover_time: i64,
+    /// Epoch seconds when failback completed, if the recovery was returned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub failback_time: Option<i64>,
+    /// VMID registered on the source after failback, if completed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub source_restore_vmid: Option<u32>,
+    /// Whether the promoted target guest was removed after successful failback.
+    #[serde(default)]
+    pub target_cleaned: bool,
+    /// Persistent promotion lifecycle.
+    #[serde(default)]
+    pub lifecycle: OffsiteFailoverLifecycle,
+    /// Epoch seconds when the promotion was explicitly abandoned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub abandoned_time: Option<i64>,
+    /// Live state of the promoted target guest.
+    #[serde(default)]
+    pub target_guest_state: OffsiteGuestState,
+    /// Current promoted guest name observed on the target.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub current_name: Option<String>,
+    /// Live state of the original or restored source guest.
+    #[serde(default)]
+    pub source_guest_state: OffsiteGuestState,
+    /// Current failback lineage state.
+    #[serde(default)]
+    pub lineage: OffsiteFailbackLineage,
+    /// Epoch seconds when live state was last checked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub last_checked: Option<i64>,
+    /// Reconciliation or remediation detail.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub status_message: Option<String>,
+}
+
+#[api]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+/// Destination policy used when returning a promoted guest to its source remote.
+pub enum OffsiteFailbackRestoreMode {
+    /// Replace the original source guest using its original VMID.
+    #[default]
+    #[serde(rename = "replace-original")]
+    ReplaceOriginal,
+    /// Register the returned guest under a new VMID on the original source node.
+    #[serde(rename = "restore-as-new")]
+    RestoreAsNew,
+}
+
+#[api(
+    properties: {
+        "restore-vmid": {
+            type: Integer,
+            minimum: 1,
+            maximum: 999_999_999,
+        },
+        "restore-mode": { type: OffsiteFailbackRestoreMode },
+        "recovered-name": {
+            schema: OFFSITE_REPLICATION_RECOVERED_NAME_SCHEMA,
+            optional: true,
+        },
+        "start-guest": {
+            type: Boolean,
+            optional: true,
+        },
+        "allow-full": {
+            type: Boolean,
+            optional: true,
+        },
+        "force": {
+            type: Boolean,
+            optional: true,
+        },
+        "cleanup-target": {
+            type: Boolean,
+            optional: true,
+        },
+    },
+)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+/// Parameters for sending a promoted recovery VM back to the original source node.
+pub struct OffsiteFailbackRequest {
+    /// VMID of the promoted recovery guest on the target node.
+    pub recovery_vmid: u32,
+    /// VMID to create on the original source node.
+    pub restore_vmid: u32,
+    /// Whether the original guest is replaced or a new source-side guest is created.
+    #[serde(default)]
+    pub restore_mode: OffsiteFailbackRestoreMode,
+    /// Optional guest name override on the original source node.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovered_name: Option<String>,
+    /// Start the guest after registration on the original source node.
+    #[serde(default)]
+    pub start_guest: bool,
+    /// Allow a full send when the common base snapshot is missing.
+    #[serde(default)]
+    pub allow_full: bool,
+    /// Confirm destructive replacement of an existing guest on the original source node.
+    #[serde(default)]
+    pub force: bool,
+    /// Remove the stopped promoted guest on the target after a successful failback.
+    #[serde(default)]
+    pub cleanup_target: bool,
+}
+
+#[api]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+/// Result of failback safety and lineage checks.
+pub struct OffsiteFailbackPrecheck {
+    /// Whether incremental failback is possible.
+    pub incremental: bool,
+    /// Common base snapshot used for incremental failback, if found.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub common_snapshot: Option<String>,
+    /// Whether a full send would be required.
+    pub full_required: bool,
+    /// Whether the original source VMID is currently registered on the source node.
+    pub source_guest_exists: bool,
+    /// Whether the original source guest is currently running.
+    pub source_guest_running: bool,
+    /// Whether the selected promoted recovery guest is currently running.
+    pub recovery_guest_running: bool,
+    /// VMID recommended when restoring as a separate source-side guest.
+    pub suggested_restore_vmid: u32,
+    /// Human-readable status message.
+    pub message: String,
 }
 
 #[api(

@@ -8,12 +8,13 @@ use proxmox_sortable_macro::sortable;
 use pdm_api_types::{
     verify_offsite_recovered_name, verify_offsite_snapshot, verify_offsite_ssh_key_path,
     verify_offsite_ssh_user, verify_offsite_target_dataset, Authid, ConfigDigest,
-    OffsiteFailoverRequest, OffsiteRecoveryPoint, OffsiteReplicationJob,
-    OffsiteReplicationJobStatus, OffsiteReplicationJobUpdater, OffsiteReplicationRun,
-    OffsiteSshKeygenRequest, OffsiteSshKeygenResult, OffsiteSshPrepareRequest,
-    OffsiteSshPrepareResult, OFFSITE_REPLICATION_HISTORY_LIMIT_SCHEMA,
-    OFFSITE_REPLICATION_ID_SCHEMA, OFFSITE_REPLICATION_SNAPSHOT_SCHEMA, PRIV_RESOURCE_AUDIT,
-    PRIV_RESOURCE_MANAGE, PROXMOX_SAFE_ID_REGEX,
+    OffsiteFailbackPrecheck, OffsiteFailbackRequest, OffsiteFailoverRecord, OffsiteFailoverRequest,
+    OffsiteRecoveryPoint, OffsiteReplicationJob, OffsiteReplicationJobStatus,
+    OffsiteReplicationJobUpdater, OffsiteReplicationRun, OffsiteSshKeygenRequest,
+    OffsiteSshKeygenResult, OffsiteSshPrepareRequest, OffsiteSshPrepareResult,
+    OFFSITE_REPLICATION_HISTORY_LIMIT_SCHEMA, OFFSITE_REPLICATION_ID_SCHEMA,
+    OFFSITE_REPLICATION_SNAPSHOT_SCHEMA, PRIV_RESOURCE_AUDIT, PRIV_RESOURCE_MANAGE,
+    PROXMOX_SAFE_ID_REGEX,
 };
 
 const ITEM_ROUTER: Router = Router::new()
@@ -24,7 +25,20 @@ const ITEM_ROUTER: Router = Router::new()
 
 #[sortable]
 const ITEM_SUBDIRS: SubdirMap = &sorted!([
+    ("failback", &Router::new().post(&API_METHOD_FAILBACK)),
+    (
+        "failback-precheck",
+        &Router::new().post(&API_METHOD_FAILBACK_PRECHECK)
+    ),
     ("failover", &Router::new().post(&API_METHOD_FAILOVER)),
+    (
+        "failover-records",
+        &Router::new().get(&API_METHOD_LIST_FAILOVER_RECORDS)
+    ),
+    (
+        "failover-record-abandon",
+        &Router::new().post(&API_METHOD_ABANDON_FAILOVER_RECORD)
+    ),
     ("history", &Router::new().get(&API_METHOD_LIST_HISTORY)),
     (
         "recovery-snapshot",
@@ -33,6 +47,10 @@ const ITEM_SUBDIRS: SubdirMap = &sorted!([
     (
         "recovery-points",
         &Router::new().get(&API_METHOD_LIST_RECOVERY_POINTS)
+    ),
+    (
+        "resume",
+        &Router::new().post(&API_METHOD_RESUME_REPLICATION)
     ),
     ("run-now", &Router::new().post(&API_METHOD_RUN_NOW)),
 ]);
@@ -89,6 +107,19 @@ fn validate_ssh_keygen_request(request: &OffsiteSshKeygenRequest) -> Result<(), 
 
 fn validate_failover_request(request: &OffsiteFailoverRequest) -> Result<(), Error> {
     verify_offsite_snapshot(&request.snapshot)?;
+    if let Some(name) = request.recovered_name.as_deref() {
+        verify_offsite_recovered_name(name)?;
+    }
+    Ok(())
+}
+
+fn validate_failback_request(request: &OffsiteFailbackRequest) -> Result<(), Error> {
+    if request.recovery_vmid == 0 {
+        bail!("recovery VMID must be greater than zero");
+    }
+    if request.restore_vmid == 0 {
+        bail!("restore VMID must be greater than zero");
+    }
     if let Some(name) = request.recovered_name.as_deref() {
         verify_offsite_recovered_name(name)?;
     }
@@ -348,6 +379,7 @@ fn update_job(
     )?;
     check_target_remote_privs(rpcenv, &job.target_remote, PRIV_RESOURCE_MANAGE)?;
 
+    crate::offsite_replication::ensure_lifecycle_safe_update(&config.jobs[position], &job)?;
     config.jobs[position] = job.clone();
     pdm_config::offsite_replication::save_config(&config)?;
     crate::offsite_replication::ensure_job_state(&job.id)?;
@@ -391,6 +423,7 @@ fn delete_job(
     };
     check_source_guest_privs(rpcenv, &job, PRIV_RESOURCE_MANAGE)?;
     check_target_remote_privs(rpcenv, &job.target_remote, PRIV_RESOURCE_MANAGE)?;
+    crate::offsite_replication::ensure_job_can_be_removed(&job)?;
 
     if purge_target_snapshots.unwrap_or(false) {
         crate::offsite_replication::purge_target_snapshots_for_job(&job)?;
@@ -499,6 +532,126 @@ fn delete_recovery_snapshot(
     check_source_guest_privs(rpcenv, job, PRIV_RESOURCE_MANAGE)?;
     check_target_remote_privs(rpcenv, &job.target_remote, PRIV_RESOURCE_MANAGE)?;
     crate::offsite_replication::delete_recovery_point(job, snapshot.trim())
+}
+
+#[api(
+    protected: true,
+    input: {
+        description: "List recorded failovers for an off-site replication job.",
+        properties: {
+            id: { schema: OFFSITE_REPLICATION_ID_SCHEMA },
+        },
+    },
+    access: {
+        permission: &Permission::Privilege(&["resource"], PRIV_RESOURCE_AUDIT, true),
+    },
+    returns: {
+        description: "Recorded failover metadata usable for failback.",
+        type: Array,
+        items: { type: OffsiteFailoverRecord },
+    },
+)]
+/// List failover records available for failback.
+fn list_failover_records(
+    id: String,
+    rpcenv: &mut dyn RpcEnvironment,
+) -> Result<Vec<OffsiteFailoverRecord>, Error> {
+    let (config, _) = pdm_config::offsite_replication::config()?;
+    let Some(job) = find_job(&config.jobs, &id) else {
+        http_bail!(NOT_FOUND, "job '{}' does not exist", id);
+    };
+
+    check_source_guest_privs(rpcenv, job, PRIV_RESOURCE_AUDIT)?;
+    check_target_remote_privs(rpcenv, &job.target_remote, PRIV_RESOURCE_AUDIT)?;
+
+    crate::offsite_replication::list_reconciled_failover_records(job)
+}
+
+#[api(
+    protected: true,
+    input: {
+        properties: {
+            id: { schema: OFFSITE_REPLICATION_ID_SCHEMA },
+            "record-id": {
+                type: String,
+                description: "Stable identifier of the promoted-guest record.",
+            },
+        },
+    },
+    access: {
+        permission: &Permission::Privilege(&["resource"], PRIV_RESOURCE_MANAGE, true),
+    },
+)]
+/// Archive an active promoted-guest record without deleting target data.
+fn abandon_failover_record(
+    id: String,
+    record_id: String,
+    rpcenv: &mut dyn RpcEnvironment,
+) -> Result<(), Error> {
+    let (config, _) = pdm_config::offsite_replication::config()?;
+    let Some(job) = find_job(&config.jobs, &id) else {
+        http_bail!(NOT_FOUND, "job '{}' does not exist", id);
+    };
+    check_source_guest_privs(rpcenv, job, PRIV_RESOURCE_MANAGE)?;
+    check_target_remote_privs(rpcenv, &job.target_remote, PRIV_RESOURCE_MANAGE)?;
+    crate::offsite_replication::abandon_failover_record(job, &record_id)
+}
+
+#[api(
+    protected: true,
+    input: {
+        properties: {
+            id: { schema: OFFSITE_REPLICATION_ID_SCHEMA },
+        },
+    },
+    access: {
+        permission: &Permission::Privilege(&["resource"], PRIV_RESOURCE_MANAGE, true),
+    },
+)]
+/// Resume a suspended replication job after verifying that no active promotion remains.
+fn resume_replication(id: String, rpcenv: &mut dyn RpcEnvironment) -> Result<(), Error> {
+    let (config, _) = pdm_config::offsite_replication::config()?;
+    let Some(job) = find_job(&config.jobs, &id) else {
+        http_bail!(NOT_FOUND, "job '{}' does not exist", id);
+    };
+    check_source_guest_privs(rpcenv, job, PRIV_RESOURCE_MANAGE)?;
+    check_target_remote_privs(rpcenv, &job.target_remote, PRIV_RESOURCE_MANAGE)?;
+    crate::offsite_replication::resume_suspended_replication(job)
+}
+
+#[api(
+    protected: true,
+    input: {
+        description: "Check whether failback can use an incremental ZFS stream.",
+        properties: {
+            id: { schema: OFFSITE_REPLICATION_ID_SCHEMA },
+            request: {
+                type: OffsiteFailbackRequest,
+                flatten: true,
+            },
+        },
+    },
+    access: {
+        permission: &Permission::Privilege(&["resource"], PRIV_RESOURCE_AUDIT, true),
+    },
+    returns: { type: OffsiteFailbackPrecheck },
+)]
+/// Check failback lineage and safety before starting a failback worker.
+fn failback_precheck(
+    id: String,
+    request: OffsiteFailbackRequest,
+    rpcenv: &mut dyn RpcEnvironment,
+) -> Result<OffsiteFailbackPrecheck, Error> {
+    validate_failback_request(&request)?;
+    let (config, _) = pdm_config::offsite_replication::config()?;
+    let Some(job) = find_job(&config.jobs, &id) else {
+        http_bail!(NOT_FOUND, "job '{}' does not exist", id);
+    };
+
+    check_source_guest_privs(rpcenv, job, PRIV_RESOURCE_AUDIT)?;
+    check_target_remote_privs(rpcenv, &job.target_remote, PRIV_RESOURCE_AUDIT)?;
+
+    crate::offsite_replication::failback_precheck(job, &request)
 }
 
 #[api(
@@ -635,4 +788,44 @@ fn failover(
         .parse()?;
 
     crate::offsite_replication::run_failover_now(job.clone(), request, &auth_id)
+}
+
+#[api(
+    protected: true,
+    input: {
+        description: "Send a promoted recovery VM back to the original source node.",
+        properties: {
+            id: { schema: OFFSITE_REPLICATION_ID_SCHEMA },
+            request: {
+                type: OffsiteFailbackRequest,
+                flatten: true,
+            },
+        },
+    },
+    access: {
+        permission: &Permission::Privilege(&["resource"], PRIV_RESOURCE_MANAGE, true),
+    },
+    returns: { schema: proxmox_schema::upid::UPID_SCHEMA },
+)]
+/// Fail back a promoted recovery VM to the original source node.
+fn failback(
+    id: String,
+    request: OffsiteFailbackRequest,
+    rpcenv: &mut dyn RpcEnvironment,
+) -> Result<String, Error> {
+    validate_failback_request(&request)?;
+    let (config, _) = pdm_config::offsite_replication::config()?;
+    let Some(job) = find_job(&config.jobs, &id) else {
+        http_bail!(NOT_FOUND, "job '{}' does not exist", id);
+    };
+
+    check_source_guest_privs(rpcenv, job, PRIV_RESOURCE_MANAGE)?;
+    check_target_remote_privs(rpcenv, &job.target_remote, PRIV_RESOURCE_MANAGE)?;
+
+    let auth_id: pdm_api_types::Authid = rpcenv
+        .get_auth_id()
+        .ok_or_else(|| http_err!(UNAUTHORIZED, "missing auth id"))?
+        .parse()?;
+
+    crate::offsite_replication::run_failback_now(job.clone(), request, &auth_id)
 }

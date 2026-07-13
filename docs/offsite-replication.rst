@@ -55,6 +55,27 @@ Recommended basic review flow:
 4. Open ``Failover / Restore``, select a recovery snapshot and run
    ``Promote`` (or ``Promote + Start``).
 5. Confirm a recovery VM is created on the target node.
+   The job is suspended while an active promoted guest exists, preventing the
+   scheduler from writing misleading failures against an unavailable source.
+6. Select the promoted guest record, run ``Failback Precheck``, then choose
+   either ``Replace Original`` or ``Restore As New`` before returning it to the
+   source node. The failback task snapshots the promoted guest's current disk
+   state itself; it does not reuse the recovery point selected for promotion.
+
+For promotions created from this feature version, recovery disks are ZFS clones
+of the selected recovery snapshots. This preserves the ZFS lineage required for
+an incremental failback to the original guest. Older recovery VMs, or recovery
+VMs whose clone lineage is no longer available, are shown by the precheck as
+requiring an explicit full transfer. The precheck compares ZFS snapshot GUIDs,
+not only snapshot names. A full transfer can be restored under a new VMID
+without replacing an existing source guest.
+
+Promoted guest records retain their audit lifecycle and also show reconciled
+source VM, target VM, and ZFS lineage state. If a recovery VM is changed or
+removed outside PDM, refresh the panel to see its current state. Use
+``Archive / Abandon`` to close a stale workflow explicitly; records are not
+silently removed. Archiving does not delete a target VM: remove any retained
+promoted guest before using ``Resume Replication``.
 
 Encrypted ZFS stream smoke path:
 
@@ -74,6 +95,26 @@ Validation Notes
   is unavailable in the VM.
 * ``zfs-stream=auto`` selects raw stream mode for encrypted source datasets.
 * Recovery-point retention is bound by ``Max Snapshots``. Run history retention
-  is controlled separately via ``History Limit``.
+  is controlled separately via ``History Limit``. Recoverable points are stored
+  in a dedicated catalog, so reducing or exhausting run history does not hide
+  snapshots that remain usable on the target.
+* Failback stops the promoted guest before taking its return snapshot. Target
+  cleanup is optional and is performed only after the source-side guest has
+  been registered successfully. When the promoted target guest is retained,
+  replication stays suspended until that guest is removed so its ZFS clone
+  cannot pin snapshots needed by retention cleanup.
+* Full fallback has no common source/target lineage. With target cleanup
+  enabled, PDM therefore resets only the affected replication datasets after
+  source registration so the next run can establish a new full baseline. The
+  reset refuses datasets containing snapshots outside the current job.
+* Replacement failback receives all returned disks into source-side staging
+  datasets before removing the old source VM. A failed transfer leaves the old
+  source untouched; a failed final registration leaves the returned datasets
+  available for diagnosis and retry. Incremental failback seeds each staging
+  dataset from the common source snapshot before applying the promoted guest's
+  delta; staging is independent rather than a clone so ZFS can receive it. The
+  promoted target clone is temporarily promoted while producing a normal
+  incremental stream, then the original target lineage is restored before
+  cleanup.
 * Promoted VMs might require manual NIC/network adjustments depending on source
   and target network topology.
