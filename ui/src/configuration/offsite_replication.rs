@@ -19,8 +19,8 @@ use pwt::state::{Selection, Store};
 use pwt::widget::data_table::{DataTable, DataTableColumn, DataTableHeader};
 use pwt::widget::form::{Checkbox, Combobox, DisplayField, Field, FormContext};
 use pwt::widget::{
-    ActionIcon, Button, ButtonType, Column, ConfirmDialog, Container, Dialog, Fa, InputPanel, List,
-    ListTile, Panel, Row, TabBarItem, TabPanel, Toolbar, Tooltip, Trigger,
+    Button, ButtonType, Column, ConfirmDialog, Container, Dialog, Fa, InputPanel, List, ListTile,
+    Panel, Row, TabBarItem, TabPanel, Toolbar, Trigger,
 };
 
 use proxmox_schema::IntegerSchema;
@@ -174,6 +174,10 @@ pub enum Msg {
     UpdateFailbackStart(bool),
     FailbackRecordSelected,
     ToggleFailoverAdvanced,
+    ToggleFailbackTechnicalDetails,
+    ToggleRecoveryMoreActions,
+    ToggleRecoveryPoints,
+    TogglePromotionHistory,
     ResetFailoverDefaults,
     JobsFilterChanged(String),
     JobsJobChanged(String),
@@ -342,7 +346,6 @@ pub struct OffsiteReplicationPanelComp {
     guest_placement_loading: bool,
     guest_placement_resources: Vec<RemoteResources>,
     guest_placement_store: Store<RecoveryGuestRow>,
-    guest_placement_columns: Rc<Vec<DataTableHeader<RecoveryGuestRow>>>,
     guest_placement_timer: Option<Timeout>,
     recovery_filter_text: String,
     recovery_filter_mode: String,
@@ -356,6 +359,10 @@ pub struct OffsiteReplicationPanelComp {
     failover_start_guest: bool,
     failover_form_dirty: bool,
     failover_advanced_expanded: bool,
+    failback_technical_details_expanded: bool,
+    recovery_more_actions_expanded: bool,
+    recovery_points_expanded: bool,
+    promotion_history_expanded: bool,
     failover_running: bool,
     failover_last_task: Option<String>,
     failback_running: bool,
@@ -669,85 +676,6 @@ impl OffsiteReplicationPanelComp {
                 .flex(2)
                 .render(|record: &OffsiteFailoverRecord| {
                     snapshot_tail(&record.source_snapshot).into()
-                })
-                .into(),
-        ])
-    }
-
-    fn guest_placement_columns(
-        link: proxmox_yew_comp::LoadableComponentScope<Self>,
-    ) -> Rc<Vec<DataTableHeader<RecoveryGuestRow>>> {
-        Rc::new(vec![
-            DataTableColumn::new(tr!("Role"))
-                .width("150px")
-                .get_property(|row: &RecoveryGuestRow| row.role.as_str())
-                .into(),
-            DataTableColumn::new(tr!("Name"))
-                .flex(2)
-                .get_property(|row: &RecoveryGuestRow| row.name.as_str())
-                .into(),
-            DataTableColumn::new(tr!("VMID"))
-                .width("90px")
-                .render(|row: &RecoveryGuestRow| row.vmid.to_string().into())
-                .into(),
-            DataTableColumn::new(tr!("Status"))
-                .width("130px")
-                .render(|row: &RecoveryGuestRow| {
-                    if let Some(resource) = row.resource.as_ref() {
-                        html! {
-                            <span style="display:flex; align-items:center; gap:6px;">
-                                {render_status_icon(resource)}
-                                {guest_status_label(resource.status())}
-                            </span>
-                        }
-                    } else {
-                        let icon = if row.status == tr!("Missing") {
-                            Fa::new("exclamation-triangle").class(ColorScheme::Warning)
-                        } else {
-                            Fa::new("question-circle").class(ColorScheme::Neutral)
-                        };
-                        html! {
-                            <span style="display:flex; align-items:center; gap:6px;">
-                                {icon}
-                                {row.status.clone()}
-                            </span>
-                        }
-                    }
-                })
-                .into(),
-            DataTableColumn::new(tr!("Remote"))
-                .width("150px")
-                .get_property(|row: &RecoveryGuestRow| row.remote.as_str())
-                .into(),
-            DataTableColumn::new(tr!("Node"))
-                .width("150px")
-                .get_property(|row: &RecoveryGuestRow| row.node.as_str())
-                .into(),
-            DataTableColumn::new(tr!("Lifecycle"))
-                .width("150px")
-                .get_property(|row: &RecoveryGuestRow| row.lifecycle.as_str())
-                .into(),
-            DataTableColumn::new(tr!("Open in PVE"))
-                .width("100px")
-                .justify("right")
-                .render(move |row: &RecoveryGuestRow| {
-                    let Some(resource) = row.resource.as_ref() else {
-                        return html! {};
-                    };
-                    let Some(url) =
-                        get_deep_url(&link, &row.remote, Some(&row.node), &resource.id())
-                    else {
-                        return html! {};
-                    };
-                    Tooltip::new(
-                        ActionIcon::new("fa fa-fw fa-external-link")
-                            .aria_label(tr!("Open in PVE UI"))
-                            .on_activate(move |_| {
-                                let _ = gloo_utils::window().open_with_url(&url.href());
-                            }),
-                    )
-                    .tip(tr!("Open in PVE UI"))
-                    .into()
                 })
                 .into(),
         ])
@@ -1490,6 +1418,10 @@ impl OffsiteReplicationPanelComp {
         self.failover_start_guest = false;
         self.failover_form_dirty = false;
         self.failover_advanced_expanded = false;
+        self.failback_technical_details_expanded = false;
+        self.recovery_more_actions_expanded = false;
+        self.recovery_points_expanded = false;
+        self.promotion_history_expanded = false;
     }
 
     fn set_failback_defaults_for_job(&mut self, job: &OffsiteReplicationJobStatus) {
@@ -1508,6 +1440,7 @@ impl OffsiteReplicationPanelComp {
     fn clear_failback_precheck(&mut self) {
         self.failback_precheck = None;
         self.failback_replace_source_guest = false;
+        self.failback_technical_details_expanded = false;
     }
 
     fn selected_recovery_snapshot(&self) -> Result<String, Error> {
@@ -1841,7 +1774,6 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
             guest_placement_loading: false,
             guest_placement_resources: Vec::new(),
             guest_placement_store: Store::new(),
-            guest_placement_columns: Self::guest_placement_columns(ctx.link().clone()),
             guest_placement_timer: None,
             recovery_filter_text: String::new(),
             recovery_filter_mode: "all".to_string(),
@@ -1857,6 +1789,10 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
             failover_start_guest: false,
             failover_form_dirty: false,
             failover_advanced_expanded: false,
+            failback_technical_details_expanded: false,
+            recovery_more_actions_expanded: false,
+            recovery_points_expanded: false,
+            promotion_history_expanded: false,
             failover_running: false,
             failover_last_task: None,
             failback_running: false,
@@ -2372,6 +2308,15 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                         }
                         self.failover_record_store.set_data(records.clone());
                         self.failover_records = records;
+                        if self
+                            .failover_records
+                            .iter()
+                            .filter(|record| record.lifecycle == OffsiteFailoverLifecycle::Active)
+                            .count()
+                            > 1
+                        {
+                            self.promotion_history_expanded = true;
+                        }
                         if selection_changed
                             || previous_live_state
                                 != failover_records_live_state(&self.failover_records)
@@ -2423,6 +2368,15 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                     records.sort_by(|a, b| b.failover_time.cmp(&a.failover_time));
                     self.failover_record_store.set_data(records.clone());
                     self.failover_records = records;
+                    if self
+                        .failover_records
+                        .iter()
+                        .filter(|record| record.lifecycle == OffsiteFailoverLifecycle::Active)
+                        .count()
+                        > 1
+                    {
+                        self.promotion_history_expanded = true;
+                    }
                 }
                 self.rebuild_guest_placement();
                 if previous_records != failover_records_live_state(&self.failover_records)
@@ -2725,6 +2679,19 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
             }
             Msg::ToggleFailoverAdvanced => {
                 self.failover_advanced_expanded = !self.failover_advanced_expanded;
+            }
+            Msg::ToggleFailbackTechnicalDetails => {
+                self.failback_technical_details_expanded =
+                    !self.failback_technical_details_expanded;
+            }
+            Msg::ToggleRecoveryMoreActions => {
+                self.recovery_more_actions_expanded = !self.recovery_more_actions_expanded;
+            }
+            Msg::ToggleRecoveryPoints => {
+                self.recovery_points_expanded = !self.recovery_points_expanded;
+            }
+            Msg::TogglePromotionHistory => {
+                self.promotion_history_expanded = !self.promotion_history_expanded;
             }
             Msg::ResetFailoverDefaults => {
                 if let Some(job) = self.selected_failover_job() {
@@ -3514,21 +3481,6 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                     tr!("Select a recoverable point and promote it if the source workload must be recovered on the target."),
                 )
             };
-            let selected_record_text = selected_failover_record
-                .as_ref()
-                .map(|record| {
-                    format!(
-                        "{} {} ({})",
-                        tr!("VMID"),
-                        record.recovery_vmid,
-                        record
-                            .current_name
-                            .clone()
-                            .or_else(|| record.recovered_name.clone())
-                            .unwrap_or_else(|| tr!("unnamed"))
-                    )
-                })
-                .unwrap_or_else(|| tr!("No promoted guest selected"));
             let failover_hint = if self.failover_running {
                 tr!("Starting failover task, check the Tasks menu for live status.")
             } else if self.recovery_points_loading {
@@ -3574,102 +3526,49 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                     let names = precheck
                         .repair_target_snapshots
                         .iter()
-                        .take(3)
                         .map(|snapshot| snapshot_tail(snapshot))
                         .collect::<Vec<_>>()
                         .join(", ");
-                    if precheck.repair_target_snapshots.len() > 3 {
-                        format!(
-                            "{} ({names}, +{})",
-                            precheck.repair_target_snapshots.len(),
-                            precheck.repair_target_snapshots.len() - 3
-                        )
-                    } else {
-                        format!("{} ({names})", precheck.repair_target_snapshots.len())
-                    }
+                    format!("{} ({names})", precheck.repair_target_snapshots.len())
                 };
                 html! {
-                    <div style="margin-top:8px;">
+                    <div class="pdm-recovery-precheck">
                         <i class={icon}></i>
                         {" "}
                         <b>{summary}</b>
                         <div style="opacity:0.8; margin-top:4px;">
                             {precheck.message.clone()}
                         </div>
-                        {
-                            precheck.common_snapshot.as_ref().map(|snapshot| html! {
-                                <div style="opacity:0.8; margin-top:4px;">
-                                    {format!("{}: {snapshot}", tr!("Common snapshot"))}
+                        {if self.failback_technical_details_expanded {
+                            html! {
+                                <div class="pdm-recovery-technical-details">
+                                    {precheck.common_snapshot.as_ref().map(|snapshot| html! {
+                                        <div>{format!("{}: {snapshot}", tr!("Common snapshot"))}</div>
+                                    }).unwrap_or_default()}
+                                    <div>{format!(
+                                        "{}: {}",
+                                        tr!("Repair mode"),
+                                        failback_repair_mode_text(precheck.repair_mode),
+                                    )}</div>
+                                    <div>{format!("{}: {repair_snapshot}", tr!("Repair snapshot"))}</div>
+                                    <div>{format!(
+                                        "{}: {repair_target_summary}",
+                                        tr!("Repair target snapshots"),
+                                    )}</div>
+                                    <div>{format!(
+                                        "{}: {}",
+                                        tr!("Repair requires full reseed"),
+                                        if precheck.repair_requires_full_reseed { tr!("Yes") } else { tr!("No") },
+                                    )}</div>
                                 </div>
-                            }).unwrap_or_default()
-                        }
-                        <div style="opacity:0.8; margin-top:4px;">
-                            {format!(
-                                "{}: {}",
-                                tr!("Repair mode"),
-                                failback_repair_mode_text(precheck.repair_mode),
-                            )}
-                        </div>
-                        <div style="opacity:0.8; margin-top:4px;">
-                            {format!("{}: {repair_snapshot}", tr!("Repair snapshot"))}
-                        </div>
-                        <div style="opacity:0.8; margin-top:4px;">
-                            {format!(
-                                "{}: {repair_target_summary}",
-                                tr!("Repair target snapshots"),
-                            )}
-                        </div>
-                        <div style="opacity:0.8; margin-top:4px;">
-                            {format!(
-                                "{}: {}",
-                                tr!("Repair requires full reseed"),
-                                if precheck.repair_requires_full_reseed {
-                                    tr!("Yes")
-                                } else {
-                                    tr!("No")
-                                },
-                            )}
-                        </div>
+                            }
+                        } else { html! {} }}
                     </div>
                 }
             });
             let recovery_panel: Html = Panel::new()
                 .border(true)
-                .style("height", "100%")
                 .title(tr!("Promote / Restore"))
-                .with_child(
-                    Toolbar::new()
-                        .with_child(
-                            Button::new(tr!("Select Job"))
-                                .icon_class("fa fa-search")
-                                .disabled(!has_jobs || self.failover_running)
-                                .on_activate(ctx.link().callback(|_| Msg::OpenFailoverJobPicker)),
-                        )
-                        .with_child(
-                            html! {<span style="opacity:0.85;">{format!("{}: {}", tr!("Job"), failover_job_value.clone())}</span>},
-                        )
-                        .with_flex_spacer()
-                        .with_child(
-                            Button::refresh(
-                                self.recovery_points_loading
-                                    || self.failover_records_loading
-                                    || self.guest_placement_loading
-                                    || self.failover_running,
-                            )
-                                .on_activate({
-                                    let id = id.clone();
-                                    let link = ctx.link().clone();
-                                    move |_| {
-                                        link.send_message(Msg::OpenFailover(id.clone().into()))
-                                    }
-                                }),
-                        ),
-                )
-                .with_child(html! {
-                    <div style="padding: 0 12px 8px; opacity: 0.82;">
-                        {tr!("Select a recovery point, then promote it on the target node. VMID and name are generated automatically unless advanced overrides are enabled.")}
-                    </div>
-                })
                 .with_child(
                     InputPanel::new()
                         .padding(3)
@@ -3701,36 +3600,21 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                         ),
                 )
                 .with_child(
-                    Toolbar::new()
-                        .with_child(
-                            Button::new(tr!("Promote"))
-                                .icon_class("fa fa-bolt")
-                                .disabled(
-                                    !failover_ready_ok
-                                        || self.failover_running
-                                        || self.guest_placement_loading
-                                        || has_active_promotion,
-                                )
-                                .on_activate({
-                                    let link = ctx.link().clone();
-                                    let start_guest = self.failover_start_guest;
-                                    move |_| link.send_message(Msg::RequestFailover(start_guest))
-                                }),
-                        )
-                        .with_child(
-                            Button::new(tr!("Promote + Start"))
-                                .icon_class("fa fa-play-circle")
-                                .disabled(
-                                    !failover_ready_ok
-                                        || self.failover_running
-                                        || self.guest_placement_loading
-                                        || has_active_promotion,
-                                )
-                                .on_activate({
-                                    let link = ctx.link().clone();
-                                    move |_| link.send_message(Msg::RequestFailover(true))
-                                }),
-                        ),
+                    Toolbar::new().with_child(
+                        Button::new(tr!("Promote"))
+                            .icon_class("fa fa-bolt")
+                            .disabled(
+                                !failover_ready_ok
+                                    || self.failover_running
+                                    || self.guest_placement_loading
+                                    || has_active_promotion,
+                            )
+                            .on_activate({
+                                let link = ctx.link().clone();
+                                let start_guest = self.failover_start_guest;
+                                move |_| link.send_message(Msg::RequestFailover(start_guest))
+                            }),
+                    ),
                 )
                 .with_child(
                     Toolbar::new()
@@ -3787,79 +3671,23 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                 .into();
             let failback_panel: Html = Panel::new()
                 .border(true)
-                .style("height", "100%")
                 .title(tr!("Promoted Guests / Failback"))
-                .with_child(
-                    Toolbar::new()
-                        .with_child(Fa::new("undo"))
-                        .with_child(html! {
-                            <span style="opacity:0.85;">{selected_record_text}</span>
-                        })
-                        .with_flex_spacer()
-                        .with_child(
-                            Button::refresh(
-                                self.failover_records_loading
-                                    || self.guest_placement_loading
-                                    || self.failback_running,
-                            )
-                                .on_activate({
-                                    let id = id.clone();
-                                    let link = ctx.link().clone();
-                                    move |_| {
-                                        link.send_message(Msg::OpenFailover(id.clone().into()))
-                                    }
-                                }),
-                        ),
-                )
                 .with_child(html! {
-                    <div style="padding: 0 12px 8px; opacity: 0.82;">
-                        {tr!("Failback always returns the promoted guest to the original source VMID for this job. Use Promote / Restore if you need an alternate recovery VMID instead.")}
-                        {
-                            selected_failover_record.as_ref().map(|record| html! {
-                                <div style="margin-top:6px;">
-                                    {format!(
-                                        "{}: {} | {}: {} | {}: {} | {}: {}",
-                                        tr!("Lifecycle"),
-                                        failover_lifecycle_text(record.lifecycle),
-                                        tr!("Target VM"),
-                                        guest_state_text(record.target_guest_state),
-                                        tr!("Source VM"),
-                                        guest_state_text(record.source_guest_state),
-                                        tr!("Lineage"),
-                                        failback_lineage_text(record.lineage),
-                                    )}
-                                </div>
-                            }).unwrap_or_default()
-                        }
-                    </div>
-                })
-                .with_child(
-                    InputPanel::new()
-                        .padding(3)
-                        .with_field(
-                            tr!("Original Source VMID"),
-                            Field::new()
-                                .value(self.failback_restore_vmid_input.clone())
-                                .disabled(true)
-                                .on_change(ctx.link().callback(Msg::UpdateFailbackRestoreVmid)),
-                        )
-                        .with_large_field(
-                            tr!("Target Cleanup"),
-                            Checkbox::new()
+                    <div class="pdm-recovery-options">
+                        <div>
+                            {Checkbox::new()
                                 .box_label(tr!("Remove the stopped promoted guest after a successful source restore. Replication remains suspended while it is retained."))
                                 .checked(self.failback_cleanup_target)
-                                .on_change(ctx.link().callback(Msg::UpdateFailbackCleanupTarget)),
-                        ),
-                )
-                .with_child(
-                    InputPanel::new().padding(3).with_large_field(
-                        tr!("Start Guest"),
-                        Checkbox::new()
-                            .box_label(tr!("Start the restored source guest after failback"))
-                            .checked(self.failback_start_guest)
-                            .on_change(ctx.link().callback(Msg::UpdateFailbackStart)),
-                    ),
-                )
+                                .on_change(ctx.link().callback(Msg::UpdateFailbackCleanupTarget))}
+                        </div>
+                        <div>
+                            {Checkbox::new()
+                                .box_label(tr!("Start the restored source guest after failback"))
+                                .checked(self.failback_start_guest)
+                                .on_change(ctx.link().callback(Msg::UpdateFailbackStart))}
+                        </div>
+                    </div>
+                })
                 .with_optional_child(
                     failback_source_conflict.then(|| {
                         InputPanel::new().padding(3).with_large_field(
@@ -3917,20 +3745,14 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                                 }),
                         )
                         .with_child(
-                            Button::new(tr!("Failback + Start"))
-                                .icon_class("fa fa-play-circle")
-                                .disabled(
-                                    !failback_ready_ok
-                                        || self.failover_running
-                                        || self.failover_records_loading
-                                        || self.guest_placement_loading
-                                        || self.failback_running
-                                        || !failback_execution_ready,
-                                )
-                                .on_activate({
-                                    let link = ctx.link().clone();
-                                    move |_| link.send_message(Msg::RequestFailback(true))
-                                }),
+                            Button::new(if self.failback_technical_details_expanded {
+                                tr!("Hide Technical Details")
+                            } else {
+                                tr!("Technical Details")
+                            })
+                            .icon_class("fa fa-wrench")
+                            .disabled(self.failback_precheck.is_none())
+                            .on_activate(ctx.link().callback(|_| Msg::ToggleFailbackTechnicalDetails)),
                         ),
                 )
                 .with_child(html! {
@@ -3950,57 +3772,85 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                 .recovery_points
                 .iter()
                 .find(|point| point.snapshot == self.failover_snapshot_input);
-            let protection_panel: Html = Panel::new()
-                .border(true)
-                .style("height", "100%")
-                .title(tr!("Protection State"))
-                .with_child(html! {
-                    <div style="padding: 0 12px 12px; display:grid; gap:7px;">
-                        <div>
-                            <b>{tr!("Target")}{": "}</b>
-                            {selected_job.as_ref().map(|job| format!(
-                                "{} / {} / {}",
-                                job.job.target_remote, job.job.target_node, job.job.target_dataset,
-                            )).unwrap_or_else(|| tr!("Unknown"))}
-                        </div>
-                        <div>
-                            <b>{tr!("Recoverable Points")}{": "}</b>
-                            {self.recovery_points.len()}
-                        </div>
-                        <div>
-                            <b>{tr!("Selected Recovery Point")}{": "}</b>
-                            {selected_protection_point.map(|point| format!(
-                                "{} ({})",
-                                snapshot_tail(&point.snapshot),
-                                render_epoch_short(point.end_time),
-                            )).unwrap_or_else(|| tr!("None"))}
-                        </div>
-                        <div>
-                            <b>{tr!("Latest Replication State")}{": "}</b>
-                            {selected_job.as_ref().map(status_text).unwrap_or_else(|| tr!("Unknown"))}
-                        </div>
-                        <div>
-                            <b>{tr!("Job State")}{": "}</b>
-                            {if selected_job_suspended { tr!("Suspended") } else { tr!("Active") }}
-                        </div>
-                        {if !has_active_promotion && !self.recovery_points.is_empty() {
-                            html! {
-                                <div style="margin-top:4px; display:flex; align-items:center; gap:6px;">
-                                    {Fa::new("info-circle")}
-                                    <b>{tr!("Replica available; no promoted guest registered.")}</b>
-                                </div>
-                            }
-                        } else {
-                            html! {}
-                        }}
-                    </div>
+            let placement_cards = self
+                .guest_placement_store
+                .read()
+                .data()
+                .iter()
+                .cloned()
+                .map(|row| {
+                    let status_icon: Html = if let Some(resource) = row.resource.as_ref() {
+                        render_status_icon(resource).into()
+                    } else if row.status == tr!("Missing") {
+                        Fa::new("exclamation-triangle")
+                            .class(ColorScheme::Warning)
+                            .into()
+                    } else {
+                        Fa::new("question-circle")
+                            .class(ColorScheme::Neutral)
+                            .into()
+                    };
+                    let pve_link: Html = row
+                        .resource
+                        .as_ref()
+                        .and_then(|resource| {
+                            get_deep_url(ctx.link(), &row.remote, Some(&row.node), &resource.id())
+                        })
+                        .map(|url| {
+                            Button::new(tr!("Open in PVE"))
+                                .icon_class("fa fa-external-link")
+                                .on_activate(move |_| {
+                                    let _ = gloo_utils::window().open_with_url(&url.href());
+                                })
+                        })
+                        .map(Into::into)
+                        .unwrap_or_default();
+                    html! {
+                        <article class="pdm-recovery-placement-card">
+                            <div class="pdm-recovery-placement-heading">
+                                <span class="pdm-recovery-role">{row.role}</span>
+                                <span class="pdm-recovery-status">{status_icon}{row.status}</span>
+                            </div>
+                            <div class="pdm-recovery-guest-name" title={row.name.clone()}>
+                                {format!("{} ({})", row.name, row.vmid)}
+                            </div>
+                            <div class="pdm-recovery-card-meta">
+                                <span title={format!("{} / {}", row.remote, row.node)}>
+                                    {Fa::new("server")}{format!("{} / {}", row.remote, row.node)}
+                                </span>
+                                <span>{Fa::new("exchange")}{row.lifecycle}</span>
+                            </div>
+                            {pve_link}
+                        </article>
+                    }
                 })
-                .into();
-            let recovery_snapshots_panel_height = if self.recovery_filters_expanded {
-                "440px"
-            } else {
-                "320px"
-            };
+                .collect::<Vec<_>>();
+            let selected_point_summary = selected_protection_point
+                .map(|point| {
+                    format!(
+                        "{} ({})",
+                        snapshot_tail(&point.snapshot),
+                        render_epoch_short(point.end_time)
+                    )
+                })
+                .unwrap_or_else(|| tr!("None"));
+            let latest_point_summary = self
+                .recovery_points
+                .first()
+                .map(|point| {
+                    format!(
+                        "{} ({})",
+                        snapshot_tail(&point.snapshot),
+                        render_epoch_short(point.end_time)
+                    )
+                })
+                .unwrap_or_else(|| tr!("None"));
+            let active_record_count = active_records.len();
+            let latest_lifecycle = self
+                .failover_records
+                .first()
+                .map(|record| failover_lifecycle_text(record.lifecycle))
+                .unwrap_or_else(|| tr!("None"));
 
             Container::new()
                 .class(pwt::css::FlexFit)
@@ -4009,23 +3859,89 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                 .with_child(
                     Column::new()
                         .class(pwt::css::FlexFit)
+                        .class("pdm-recovery-page")
                         .gap(3)
                         .with_child(
                             Panel::new()
                                 .border(true)
-                                .title(tr!("Recovery Workflow"))
+                                .title(tr!("Recovery Status"))
+                                .with_child(
+                                    Toolbar::new()
+                                        .with_child(
+                                            Button::new(tr!("Select Job"))
+                                                .icon_class("fa fa-search")
+                                                .disabled(
+                                                    !has_jobs
+                                                        || self.failover_running
+                                                        || self.failback_running,
+                                                )
+                                                .on_activate(
+                                                    ctx.link()
+                                                        .callback(|_| Msg::OpenFailoverJobPicker),
+                                                ),
+                                        )
+                                        .with_child(html! {
+                                            <span style="opacity:0.85;">{format!("{}: {}", tr!("Job"), failover_job_value.clone())}</span>
+                                        })
+                                        .with_flex_spacer()
+                                        .with_child(
+                                            Button::refresh(
+                                                self.recovery_points_loading
+                                                    || self.failover_records_loading
+                                                    || self.guest_placement_loading
+                                                    || self.failover_running
+                                                    || self.failback_running,
+                                            )
+                                            .on_activate({
+                                                let id = id.clone();
+                                                let link = ctx.link().clone();
+                                                move |_| {
+                                                    link.send_message(Msg::OpenFailover(
+                                                        id.clone().into(),
+                                                    ))
+                                                }
+                                            }),
+                                        ),
+                                )
                                 .with_child(html! {
-                                    <div style="padding:0 12px 12px; display:flex; gap:10px; align-items:flex-start;">
-                                        {Fa::new(workflow_icon).class(workflow_class)}
-                                        <div>
-                                            <div style="font-weight:600; font-size:1.08em;">{workflow_stage}</div>
-                                            <div style="margin-top:3px; opacity:0.86;">{next_action}</div>
+                                    <div class="pdm-recovery-header">
+                                        <div class="pdm-recovery-stage">
+                                            {Fa::new(workflow_icon).class(workflow_class)}
+                                            <div>
+                                                <div class="pdm-recovery-stage-title">{workflow_stage}</div>
+                                                <div class="pdm-recovery-next-action">{next_action}</div>
+                                            </div>
+                                        </div>
+                                        <div class="pdm-recovery-chips">
+                                            <span title={selected_job.as_ref().map(|job| job.job.target_dataset.clone()).unwrap_or_default()}>
+                                                {Fa::new("bullseye")}
+                                                {selected_job.as_ref().map(|job| format!("{} / {} / {}", job.job.target_remote, job.job.target_node, job.job.target_dataset)).unwrap_or_else(|| tr!("Unknown target"))}
+                                            </span>
+                                            <span>{Fa::new("history")}{format!("{} {}", self.recovery_points.len(), tr!("recovery points"))}</span>
+                                            <span title={selected_point_summary.clone()}>{Fa::new("clock-o")}{selected_point_summary.clone()}</span>
+                                            <span>{Fa::new("refresh")}{selected_job.as_ref().map(status_text).unwrap_or_else(|| tr!("Unknown"))}</span>
+                                            <span>{Fa::new(if selected_job_suspended { "pause" } else { "play" })}{if selected_job_suspended { tr!("Replication suspended") } else { tr!("Replication active") }}</span>
                                         </div>
                                     </div>
                                 })
                                 .with_optional_child(source_and_target_running.then(|| html! {
-                                    <div class="pwt-color-warning" style="padding:0 12px 12px; font-weight:600;">
+                                    <div class="pdm-recovery-alert pwt-color-warning">
                                         {tr!("Split-brain warning: source and promoted guests are both reported as running.")}
+                                    </div>
+                                }))
+                                .with_optional_child((source_guest_missing && !has_active_promotion).then(|| html! {
+                                    <div class="pdm-recovery-alert pwt-color-warning">
+                                        {tr!("Source guest is missing. Confirm the source outage before promoting the replica.")}
+                                    </div>
+                                }))
+                                .with_optional_child(active_guest_missing.then(|| html! {
+                                    <div class="pdm-recovery-alert pwt-color-warning">
+                                        {tr!("The active promoted guest is missing. Review its promotion record before continuing.")}
+                                    </div>
+                                }))
+                                .with_optional_child((active_record_count > 1).then(|| html! {
+                                    <div class="pdm-recovery-alert pwt-color-warning">
+                                        {tr!("Multiple active promotion records require an operator selection.")}
                                     </div>
                                 })),
                         )
@@ -4033,13 +3949,11 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                             Panel::new()
                                 .border(true)
                                 .title(tr!("Current Guest Placement"))
-                                .style("height", if active_records.len() > 1 { "250px" } else { "190px" })
                                 .with_child(
                                     Toolbar::new()
-                                        .border_bottom(true)
                                         .with_child(html! {
                                             <span style="opacity:0.78;">
-                                                {tr!("Live guest registration and power state; recovery actions remain in the guided workflow below.")}
+                                                {tr!("Live registration and power state")}
                                             </span>
                                         })
                                         .with_flex_spacer()
@@ -4055,169 +3969,90 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                                                 }),
                                         ),
                                 )
-                                .with_child(
-                                    DataTable::new(
-                                        self.guest_placement_columns.clone(),
-                                        self.guest_placement_store.clone(),
-                                    )
-                                    .striped(true)
-                                    .hover(true)
-                                    .class(pwt::css::FlexFit),
-                                ),
+                                .with_child(html! {<div class="pdm-recovery-placement-grid">{placement_cards}</div>}),
                         )
-                        .with_child(
-                            html! {
-                                <div style="display:grid; gap:12px; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); align-items:stretch;">
-                                    {if has_active_promotion { failback_panel.clone() } else { recovery_panel.clone() }}
-                                    {protection_panel}
-                                    {if has_active_promotion { recovery_panel } else { failback_panel }}
-                                </div>
-                            },
-                        )
+                        .with_child(html! {
+                            <section class="pdm-recovery-primary-action">
+                                {if has_active_promotion { failback_panel } else { recovery_panel }}
+                            </section>
+                        })
                         .with_child(
                             Panel::new()
                                 .border(true)
-                                .title(tr!("Recoverable Snapshots"))
-                                .style("height", recovery_snapshots_panel_height)
-                                .class(pwt::css::FlexFit)
+                                .title(tr!("Recovery Points"))
                                 .with_child(
                                     Toolbar::new()
-                                        .border_bottom(true)
-                                        .with_child(
-                                            Button::new(format!(
-                                                "{} ({recovery_filters_active})",
-                                                tr!("Clear Filter")
-                                            ))
-                                            .disabled(recovery_filters_active == 0)
-                                            .on_activate(ctx.link().callback(|_| Msg::ClearRecoveryFilters)),
-                                        )
-                                        .with_child(
-                                            Button::new(tr!("Filter"))
-                                                .icon_class("fa fa-filter")
-                                                .on_activate(
-                                                    ctx.link().callback(|_| Msg::ToggleRecoveryFilters),
-                                                ),
-                                        )
-                                        .with_child(
-                                            Button::new(tr!("Delete Snapshot"))
-                                                .icon_class("fa fa-trash")
-                                                .disabled(
-                                                    self.recovery_delete_running
-                                                        || self.recovery_points_loading
-                                                        || self.recovery_points.is_empty()
-                                                        || self.recovery_selection.is_empty(),
-                                                )
-                                                .on_activate(
-                                                    ctx.link()
-                                                        .callback(|_| Msg::OpenDeleteRecoverySnapshot),
-                                                ),
-                                        )
+                                        .with_child(html! {<span class="pdm-recovery-summary">{format!("{}: {}", tr!("Count"), self.recovery_points.len())}{" · "}{format!("{}: {latest_point_summary}", tr!("Latest"))}</span>})
                                         .with_flex_spacer()
                                         .with_child(
-                                            html! {<span style="opacity:0.75;">{format!("{}: {recovery_visible}/{}", tr!("Visible"), self.recovery_points.len())}</span>},
+                                            Button::new(if self.recovery_points_expanded { tr!("Collapse") } else { tr!("Expand") })
+                                                .icon_class(if self.recovery_points_expanded { "fa fa-chevron-up" } else { "fa fa-chevron-down" })
+                                                .on_activate(ctx.link().callback(|_| Msg::ToggleRecoveryPoints)),
                                         ),
                                 )
-                                .with_optional_child(if self.recovery_filters_expanded {
+                                .with_optional_child(if self.recovery_points_expanded {
                                     Some(
-                                        Panel::new()
-                                            .border_bottom(true)
-                                            .with_child(
-                                                html! {
-                                                    <div style="display:grid; gap:12px; padding: 12px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));">
-                                                        <div style="display:flex; flex-direction:column; gap:6px;">
-                                                            <div style="opacity:0.85;">{tr!("Mode")}</div>
-                                                            {Combobox::new()
-                                                                .style("width", "100%")
-                                                                .editable(false)
-                                                                .value(self.recovery_filter_mode.clone())
-                                                                .items(history_mode_items.clone())
-                                                                .on_change(ctx.link().callback(Msg::RecoveryFilterModeChanged))}
-                                                        </div>
-                                                        <div style="display:flex; flex-direction:column; gap:6px;">
-                                                            <div style="opacity:0.85;">{tr!("Recoverable")}</div>
-                                                            {Combobox::new()
-                                                                .style("width", "100%")
-                                                                .editable(false)
-                                                                .value(self.recovery_filter_recoverable.clone())
-                                                                .items(yes_no_items.clone())
-                                                                .on_change(ctx.link().callback(Msg::RecoveryFilterRecoverableChanged))}
-                                                        </div>
-                                                        <div style="display:flex; flex-direction:column; gap:6px;">
-                                                            <div style="opacity:0.85;">{tr!("Snapshot Contains")}</div>
-                                                            {Field::new()
-                                                                .style("width", "100%")
-                                                                .value(self.recovery_filter_text.clone())
-                                                                .placeholder(tr!("snapshot text"))
-                                                                .on_input(ctx.link().callback(Msg::RecoveryFilterChanged))
-                                                                .with_trigger(
-                                                                    Trigger::new(recovery_filter_clear_icon).on_activate(
-                                                                        ctx.link().callback(|_| Msg::RecoveryFilterChanged(String::new())),
-                                                                    ),
-                                                                    true,
-                                                                )}
-                                                        </div>
+                                        html! {
+                                            <div class="pdm-recovery-table-wrap">
+                                                <div class="pdm-recovery-table-actions">
+                                                    {Button::new(format!("{} ({recovery_filters_active})", tr!("Clear Filter"))).disabled(recovery_filters_active == 0).on_activate(ctx.link().callback(|_| Msg::ClearRecoveryFilters))}
+                                                    {Button::new(tr!("Filter")).icon_class("fa fa-filter").on_activate(ctx.link().callback(|_| Msg::ToggleRecoveryFilters))}
+                                                    <span>{format!("{}: {recovery_visible}/{}", tr!("Visible"), self.recovery_points.len())}</span>
+                                                </div>
+                                                {if self.recovery_filters_expanded { html! {
+                                                    <div class="pdm-recovery-filter-row">
+                                                        {Combobox::new().editable(false).value(self.recovery_filter_mode.clone()).items(history_mode_items.clone()).on_change(ctx.link().callback(Msg::RecoveryFilterModeChanged))}
+                                                        {Combobox::new().editable(false).value(self.recovery_filter_recoverable.clone()).items(yes_no_items.clone()).on_change(ctx.link().callback(Msg::RecoveryFilterRecoverableChanged))}
+                                                        {Field::new().value(self.recovery_filter_text.clone()).placeholder(tr!("snapshot text")).on_input(ctx.link().callback(Msg::RecoveryFilterChanged)).with_trigger(Trigger::new(recovery_filter_clear_icon).on_activate(ctx.link().callback(|_| Msg::RecoveryFilterChanged(String::new()))), true)}
                                                     </div>
-                                                },
-                                            ),
+                                                } } else { html! {} }}
+                                                <div class="pdm-recovery-scroll-table">
+                                                    {DataTable::new(self.recovery_columns.clone(), self.recovery_view_store.clone()).class(pwt::css::FlexFit).selection(self.recovery_selection.clone())}
+                                                </div>
+                                            </div>
+                                        },
                                     )
                                 } else {
                                     None
-                                })
-                                .with_child(
-                                    DataTable::new(
-                                        self.recovery_columns.clone(),
-                                        self.recovery_view_store.clone(),
-                                    )
-                                        .class(pwt::css::FlexFit)
-                                        .selection(self.recovery_selection.clone()),
-                                ),
+                                }),
                         )
                         .with_child(
                             Panel::new()
                                 .border(true)
-                                .title(tr!("Promoted Guests"))
-                                .style("height", "260px")
-                                .class(pwt::css::FlexFit)
+                                .title(tr!("Promotion History"))
                                 .with_child(
                                     Toolbar::new()
-                                        .border_bottom(true)
-                                        .with_child(html! {
-                                            <span style="opacity:0.75;">
-                                                {format!("{}: {}", tr!("Records"), self.failover_records.len())}
-                                            </span>
-                                        })
-                                        .with_child(
-                                            Button::new(tr!("Archive / Abandon"))
-                                                .icon_class("fa fa-archive")
-                                                .disabled(
-                                                    !selected_record_active
-                                                        || self.failback_running,
-                                                )
-                                                .on_activate(
-                                                    ctx.link().callback(|_| Msg::RequestAbandonFailover),
-                                                ),
-                                        )
-                                        .with_child(
-                                            Button::new(tr!("Resume Replication"))
-                                                .icon_class("fa fa-play")
-                                                .disabled(!selected_job_suspended)
-                                                .on_activate(
-                                                    ctx.link().callback(|_| Msg::ResumeReplication),
-                                                ),
-                                        )
+                                        .with_child(html! {<span class="pdm-recovery-summary">{format!("{}: {}", tr!("Records"), self.failover_records.len())}{" · "}{format!("{}: {active_record_count}", tr!("Active"))}{" · "}{format!("{}: {latest_lifecycle}", tr!("Latest"))}</span>})
                                         .with_flex_spacer()
                                         .with_child(
-                                            html! {<span style="opacity:0.75;">{tr!("Select a record for failback.")}</span>},
+                                            Button::new(if self.promotion_history_expanded { tr!("Collapse") } else { tr!("Expand") })
+                                                .icon_class(if self.promotion_history_expanded { "fa fa-chevron-up" } else { "fa fa-chevron-down" })
+                                                .on_activate(ctx.link().callback(|_| Msg::TogglePromotionHistory)),
                                         ),
                                 )
+                                .with_optional_child(self.promotion_history_expanded.then(|| html! {
+                                    <div class="pdm-recovery-scroll-table">
+                                        {DataTable::new(self.failover_record_columns.clone(), self.failover_record_store.clone()).class(pwt::css::FlexFit).selection(self.failover_record_selection.clone())}
+                                    </div>
+                                })),
+                        )
+                        .with_child(
+                            Panel::new()
+                                .border(true)
+                                .title(tr!("More Actions"))
                                 .with_child(
-                                    DataTable::new(
-                                        self.failover_record_columns.clone(),
-                                        self.failover_record_store.clone(),
-                                    )
-                                        .class(pwt::css::FlexFit)
-                                        .selection(self.failover_record_selection.clone()),
-                                ),
+                                    Toolbar::new()
+                                        .with_child(html! {<span style="opacity:0.78;">{tr!("Maintenance and non-primary recovery operations")}</span>})
+                                        .with_flex_spacer()
+                                        .with_child(Button::new(if self.recovery_more_actions_expanded { tr!("Collapse") } else { tr!("Expand") }).icon_class("fa fa-ellipsis-h").on_activate(ctx.link().callback(|_| Msg::ToggleRecoveryMoreActions))),
+                                )
+                                .with_optional_child(self.recovery_more_actions_expanded.then(|| html! {
+                                    <div class="pdm-recovery-more-actions">
+                                        {Button::new(tr!("Archive / Abandon")).icon_class("fa fa-archive").disabled(!selected_record_active || self.failback_running).on_activate(ctx.link().callback(|_| Msg::RequestAbandonFailover))}
+                                        {Button::new(tr!("Resume Replication")).icon_class("fa fa-play").disabled(!selected_job_suspended).on_activate(ctx.link().callback(|_| Msg::ResumeReplication))}
+                                        {Button::new(tr!("Delete Snapshot")).icon_class("fa fa-trash").disabled(self.recovery_delete_running || self.recovery_points_loading || self.recovery_points.is_empty() || self.recovery_selection.is_empty()).on_activate(ctx.link().callback(|_| Msg::OpenDeleteRecoverySnapshot))}
+                                    </div>
+                                })),
                         ),
                 )
                 .into()

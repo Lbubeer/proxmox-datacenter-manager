@@ -182,3 +182,214 @@
 .dragging-item {
     opacity: 0.5;
 }
+
+// Guided off-site recovery workflow. This file is shared by every PDM Yew theme.
+.pdm-recovery-page {
+    width: 100%;
+    max-width: 1440px;
+    min-width: 0;
+    margin-inline: auto;
+
+    &,
+    & > *,
+    .pwt-panel,
+    .pwt-panel-body {
+        min-width: 0;
+    }
+}
+
+.pdm-recovery-header {
+    display: grid;
+    gap: var(--pwt-spacer-3);
+    padding: 0 var(--pwt-spacer-3) var(--pwt-spacer-3);
+}
+
+.pdm-recovery-stage {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--pwt-spacer-3);
+    min-width: 0;
+}
+
+.pdm-recovery-stage-title {
+    font-size: 1.08em;
+    font-weight: 600;
+}
+
+.pdm-recovery-next-action {
+    margin-top: var(--pwt-spacer-1);
+    opacity: 0.86;
+}
+
+.pdm-recovery-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--pwt-spacer-2);
+
+    > span {
+        display: inline-flex;
+        align-items: center;
+        gap: var(--pwt-spacer-2);
+        max-width: 100%;
+        min-width: 0;
+        padding: var(--pwt-spacer-1) var(--pwt-spacer-2);
+        border: 1px solid var(--pwt-color-border);
+        border-radius: 999px;
+        background: var(--pwt-color-background);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+}
+
+.pdm-recovery-alert {
+    margin: 0 var(--pwt-spacer-3) var(--pwt-spacer-3);
+    padding: var(--pwt-spacer-3);
+    border: 1px solid currentColor;
+    border-radius: var(--pwt-button-corner-shape);
+    font-weight: 600;
+}
+
+.pdm-recovery-placement-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(290px, 100%), 1fr));
+    gap: var(--pwt-spacer-3);
+    padding: 0 var(--pwt-spacer-3) var(--pwt-spacer-3);
+    min-width: 0;
+}
+
+.pdm-recovery-placement-card {
+    display: flex;
+    flex-direction: column;
+    gap: var(--pwt-spacer-2);
+    min-width: 0;
+    padding: var(--pwt-spacer-3);
+    border: 1px solid var(--pwt-color-border);
+    border-radius: var(--pwt-button-corner-shape);
+    background: var(--pwt-color-background);
+}
+
+.pdm-recovery-placement-heading,
+.pdm-recovery-status,
+.pdm-recovery-card-meta span {
+    display: flex;
+    align-items: center;
+    gap: var(--pwt-spacer-2);
+    min-width: 0;
+}
+
+.pdm-recovery-placement-heading {
+    justify-content: space-between;
+    flex-wrap: wrap;
+}
+
+.pdm-recovery-role,
+.pdm-recovery-guest-name {
+    font-weight: 600;
+}
+
+.pdm-recovery-guest-name,
+.pdm-recovery-card-meta span,
+.pdm-recovery-summary {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.pdm-recovery-card-meta {
+    display: grid;
+    gap: var(--pwt-spacer-1);
+    opacity: 0.82;
+}
+
+.pdm-recovery-primary-action {
+    width: 100%;
+    max-width: 900px;
+    min-width: 0;
+    margin-inline: auto;
+}
+
+.pdm-recovery-options,
+.pdm-recovery-more-actions,
+.pdm-recovery-table-actions,
+.pdm-recovery-filter-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--pwt-spacer-3);
+    min-width: 0;
+    padding: var(--pwt-spacer-3);
+}
+
+.pdm-recovery-options > div {
+    flex: 1 1 300px;
+    min-width: 0;
+}
+
+.pdm-recovery-precheck {
+    margin-top: var(--pwt-spacer-2);
+    overflow-wrap: anywhere;
+}
+
+.pdm-recovery-technical-details {
+    display: grid;
+    gap: var(--pwt-spacer-1);
+    margin-top: var(--pwt-spacer-2);
+    padding: var(--pwt-spacer-2);
+    border-left: 3px solid var(--pwt-color-border);
+    opacity: 0.8;
+    overflow-wrap: anywhere;
+}
+
+.pdm-recovery-table-wrap,
+.pdm-recovery-scroll-table {
+    min-width: 0;
+    max-width: 100%;
+    overflow: auto;
+}
+
+.pdm-recovery-scroll-table {
+    height: min(420px, 52vh);
+    contain: inline-size;
+}
+
+.pdm-recovery-filter-row > * {
+    flex: 1 1 220px;
+    min-width: 0;
+}
+
+@media (max-width: 700px) {
+    .pdm-recovery-placement-grid {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .pdm-recovery-header,
+    .pdm-recovery-placement-grid {
+        padding-inline: var(--pwt-spacer-2);
+    }
+
+    .pdm-recovery-chips {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .pdm-recovery-chips > span,
+    .pdm-recovery-summary {
+        white-space: normal;
+        overflow-wrap: anywhere;
+    }
+
+    .pdm-recovery-options,
+    .pdm-recovery-more-actions,
+    .pdm-recovery-table-actions,
+    .pdm-recovery-filter-row {
+        align-items: stretch;
+        flex-direction: column;
+    }
+
+    .pdm-recovery-options > div,
+    .pdm-recovery-filter-row > * {
+        flex-basis: auto;
+        width: 100%;
+    }
+}
