@@ -305,6 +305,109 @@ pub struct OffsiteReplicationJobUpdater {
 }
 
 #[api]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+/// Kind of recovery operation associated with an off-site replication job.
+pub enum OffsiteRecoveryOperationKind {
+    /// Promote a recovery point on the target.
+    #[default]
+    Promote,
+    /// Return a promoted guest to its original source.
+    Failback,
+}
+
+#[api]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+/// Durable state of a recovery worker.
+pub enum OffsiteRecoveryOperationState {
+    /// The request is being submitted to the worker runtime.
+    #[default]
+    Submitting,
+    /// The worker is active.
+    Running,
+    /// The worker completed and inventory is being reconciled.
+    Reconciling,
+    /// The operation completed successfully.
+    Succeeded,
+    /// The operation failed.
+    Failed,
+}
+
+impl OffsiteRecoveryOperationState {
+    /// Whether this state still requires active UI polling.
+    pub fn is_active(self) -> bool {
+        matches!(
+            self,
+            OffsiteRecoveryOperationState::Submitting
+                | OffsiteRecoveryOperationState::Running
+                | OffsiteRecoveryOperationState::Reconciling
+        )
+    }
+}
+
+#[api]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+/// Latest recovery operation and its live progress.
+pub struct OffsiteRecoveryOperationStatus {
+    /// Operation type.
+    pub kind: OffsiteRecoveryOperationKind,
+    /// Current durable state.
+    pub state: OffsiteRecoveryOperationState,
+    /// Human-readable execution phase.
+    pub phase: String,
+    /// Worker task UPID once the worker has been accepted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upid: Option<String>,
+    /// Operation start time in epoch seconds.
+    pub start_time: i64,
+    /// Last status update in epoch seconds.
+    pub updated_time: i64,
+    /// Completion time in epoch seconds for terminal operations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_time: Option<i64>,
+    /// Recovery VMID on the target.
+    pub recovery_vmid: u32,
+    /// Restore VMID on the source for failback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restore_vmid: Option<u32>,
+    /// Selected source recovery snapshot for promotion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
+    /// Requested recovered guest name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovered_name: Option<String>,
+    /// Whether the target should be removed after failback.
+    #[serde(default)]
+    pub cleanup_target: bool,
+    /// Current disk number during a multi-disk transfer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_index: Option<u64>,
+    /// Total disk count during a multi-disk transfer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_count: Option<u64>,
+    /// Estimated total bytes for measurable transfer phases.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_bytes: Option<u64>,
+    /// Bytes observed by the stream meter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transferred_bytes: Option<u64>,
+    /// Current transfer rate in bytes per second.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_per_second: Option<u64>,
+    /// Estimated remaining time in seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eta_seconds: Option<u64>,
+    /// Whether byte-level telemetry is available for the current transfer.
+    #[serde(default)]
+    pub telemetry_available: bool,
+    /// Terminal error or reconciliation warning.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[api]
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 /// Runtime status for an off-site replication job.

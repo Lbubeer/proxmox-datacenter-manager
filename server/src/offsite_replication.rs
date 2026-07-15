@@ -1,10 +1,12 @@
 use std::collections::{HashMap, HashSet};
-use std::process::Command;
+use std::io::{BufRead, BufReader};
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Error};
 use http::uri::Authority;
-use proxmox_rest_server::{TaskState, WorkerTask};
+use proxmox_rest_server::{upid_read_status, worker_is_active_local, TaskState, WorkerTask};
 use proxmox_time::CalendarEvent;
 use serde::{Deserialize, Serialize};
 
@@ -13,10 +15,11 @@ use pdm_api_types::{
     verify_offsite_ssh_user, verify_offsite_target_dataset, Authid, OffsiteFailbackLineage,
     OffsiteFailbackPrecheck, OffsiteFailbackRepairMode, OffsiteFailbackRequest,
     OffsiteFailoverLifecycle, OffsiteFailoverRecord, OffsiteFailoverRequest, OffsiteGuestState,
+    OffsiteRecoveryOperationKind, OffsiteRecoveryOperationState, OffsiteRecoveryOperationStatus,
     OffsiteRecoveryPoint, OffsiteReplicationJob, OffsiteReplicationJobStatus,
     OffsiteReplicationRun, OffsiteReplicationRuntimeStatus, OffsiteSshKeygenRequest,
     OffsiteSshKeygenResult, OffsiteSshPrepareRequest, OffsiteSshPrepareResult,
-    OffsiteSshPrepareStep, DEFAULT_OFFSITE_REPLICATION_HISTORY_LIMIT, PROXMOX_SAFE_ID_REGEX,
+    OffsiteSshPrepareStep, DEFAULT_OFFSITE_REPLICATION_HISTORY_LIMIT, PROXMOX_SAFE_ID_REGEX, UPID,
 };
 
 use crate::jobstate::{self, Job, JobState};
@@ -40,6 +43,10 @@ const FAILOVER_RECORD_DIR: &str = concat!(
 const RECOVERY_POINT_DIR: &str = concat!(
     pdm_buildcfg::PDM_STATE_DIR_M!(),
     "/offsite-replication-recovery-points"
+);
+const RECOVERY_OPERATION_DIR: &str = concat!(
+    pdm_buildcfg::PDM_STATE_DIR_M!(),
+    "/offsite-replication-operations"
 );
 const LIFECYCLE_STATE_DIR: &str = concat!(
     pdm_buildcfg::PDM_STATE_DIR_M!(),
@@ -175,6 +182,12 @@ fn lifecycle_state_path(job_id: &str) -> std::path::PathBuf {
     path
 }
 
+fn recovery_operation_path(job_id: &str) -> std::path::PathBuf {
+    let mut path = std::path::PathBuf::from(RECOVERY_OPERATION_DIR);
+    path.push(format!("{}.json", sanitize_id(job_id)));
+    path
+}
+
 fn ensure_history_dir() -> Result<(), Error> {
     let mode = nix::sys::stat::Mode::from_bits_truncate(0o0750);
     let opts = proxmox_product_config::default_create_options().perm(mode);
@@ -208,6 +221,128 @@ fn ensure_lifecycle_state_dir() -> Result<(), Error> {
     let opts = proxmox_product_config::default_create_options().perm(mode);
     proxmox_sys::fs::create_path(LIFECYCLE_STATE_DIR, Some(opts), Some(opts))?;
     Ok(())
+}
+
+fn ensure_recovery_operation_dir() -> Result<(), Error> {
+    let mode = nix::sys::stat::Mode::from_bits_truncate(0o0750);
+    let opts = proxmox_product_config::default_create_options().perm(mode);
+    proxmox_sys::fs::create_path(RECOVERY_OPERATION_DIR, Some(opts), Some(opts))?;
+    Ok(())
+}
+
+fn save_recovery_operation(
+    job_id: &str,
+    operation: &OffsiteRecoveryOperationStatus,
+) -> Result<(), Error> {
+    ensure_recovery_operation_dir()?;
+    let raw = serde_json::to_vec_pretty(operation)?;
+    proxmox_sys::fs::replace_file(
+        recovery_operation_path(job_id),
+        &raw,
+        proxmox_product_config::default_create_options(),
+        false,
+    )
+}
+
+pub fn recovery_operation_status(
+    job_id: &str,
+) -> Result<Option<OffsiteRecoveryOperationStatus>, Error> {
+    ensure_recovery_operation_dir()?;
+    let content = proxmox_sys::fs::file_read_optional_string(recovery_operation_path(job_id))?
+        .unwrap_or_default();
+    if content.trim().is_empty() {
+        return Ok(None);
+    }
+    let mut operation: OffsiteRecoveryOperationStatus = serde_json::from_str(&content)?;
+    if operation.state == OffsiteRecoveryOperationState::Submitting
+        && operation.upid.is_none()
+        && proxmox_time::epoch_i64().saturating_sub(operation.updated_time) > 60
+    {
+        operation.state = OffsiteRecoveryOperationState::Failed;
+        operation.phase = "Failed".to_string();
+        operation.end_time = Some(proxmox_time::epoch_i64());
+        operation.message = Some("recovery worker was not started".to_string());
+        save_recovery_operation(job_id, &operation)?;
+    }
+    if operation.state.is_active() {
+        if let Some(upid) = operation
+            .upid
+            .as_deref()
+            .and_then(|upid| upid.parse::<UPID>().ok())
+            .filter(|upid| !worker_is_active_local(upid))
+        {
+            let state = upid_read_status(&upid).unwrap_or(TaskState::Unknown {
+                endtime: proxmox_time::epoch_i64(),
+            });
+            operation.updated_time = proxmox_time::epoch_i64();
+            match state {
+                TaskState::OK { .. } => {
+                    operation.state = OffsiteRecoveryOperationState::Reconciling;
+                    operation.phase = "Reconciling inventory".to_string();
+                }
+                other => {
+                    operation.state = OffsiteRecoveryOperationState::Failed;
+                    operation.phase = "Failed".to_string();
+                    operation.end_time = Some(proxmox_time::epoch_i64());
+                    operation.message = Some(other.to_string());
+                }
+            }
+            save_recovery_operation(job_id, &operation)?;
+        }
+    }
+    Ok(Some(operation))
+}
+
+fn update_recovery_operation<F>(job_id: &str, update: F) -> Result<(), Error>
+where
+    F: FnOnce(&mut OffsiteRecoveryOperationStatus),
+{
+    let mut operation = recovery_operation_status(job_id)?
+        .with_context(|| format!("recovery operation state for job '{job_id}' is missing"))?;
+    update(&mut operation);
+    operation.updated_time = proxmox_time::epoch_i64();
+    save_recovery_operation(job_id, &operation)
+}
+
+fn set_recovery_phase(job_id: &str, phase: &str) {
+    if let Err(err) = update_recovery_operation(job_id, |operation| {
+        operation.state = OffsiteRecoveryOperationState::Running;
+        operation.phase = phase.to_string();
+    }) {
+        log::warn!("failed to update recovery phase for '{job_id}': {err}");
+    }
+    proxmox_log::info!("recovery phase: {phase}");
+}
+
+fn finish_recovery_operation(job_id: &str, success: bool, message: Option<String>) {
+    if let Err(err) = update_recovery_operation(job_id, |operation| {
+        operation.state = if success {
+            OffsiteRecoveryOperationState::Reconciling
+        } else {
+            OffsiteRecoveryOperationState::Failed
+        };
+        operation.phase = if success {
+            "Reconciling inventory".to_string()
+        } else {
+            "Failed".to_string()
+        };
+        operation.end_time = (!success).then(proxmox_time::epoch_i64);
+        operation.message = message;
+        operation.bytes_per_second = None;
+        operation.eta_seconds = None;
+    }) {
+        log::warn!("failed to finish recovery operation for '{job_id}': {err}");
+    }
+}
+
+pub fn acknowledge_recovery_operation(job_id: &str) -> Result<(), Error> {
+    update_recovery_operation(job_id, |operation| {
+        if operation.state == OffsiteRecoveryOperationState::Reconciling {
+            operation.state = OffsiteRecoveryOperationState::Succeeded;
+            operation.phase = "Completed".to_string();
+            operation.end_time = Some(proxmox_time::epoch_i64());
+        }
+    })
 }
 
 fn load_recovery_point_catalog(job_id: &str) -> Result<RecoveryPointCatalog, Error> {
@@ -1040,6 +1175,139 @@ fn run_ssh_script_checked(
     }
 
     Ok(merged)
+}
+
+fn parse_recovery_stream_line(job_id: &str, line: &str) {
+    if let Some(data) = line.strip_prefix("PDM_ESTIMATE:") {
+        let fields: Vec<&str> = data.split(':').collect();
+        if fields.len() == 4 {
+            let index = fields[0].parse::<u64>().ok();
+            let count = fields[1].parse::<u64>().ok();
+            let estimate = fields[2].parse::<u64>().ok();
+            let completed = fields[3].parse::<u64>().ok();
+            let _ = update_recovery_operation(job_id, |operation| {
+                operation.phase = "Transferring disks".to_string();
+                operation.disk_index = index;
+                operation.disk_count = count;
+                operation.estimated_bytes = match (completed, estimate) {
+                    (Some(done), Some(current)) => Some(done.saturating_add(current)),
+                    _ => operation.estimated_bytes,
+                };
+                operation.telemetry_available = estimate.is_some_and(|value| value > 0);
+            });
+        }
+        return;
+    }
+
+    let Some(data) = line.strip_prefix("PDM_CSTREAM:") else {
+        return;
+    };
+    let mut fields = data.splitn(3, ':');
+    let index = fields.next().and_then(|value| value.parse::<u64>().ok());
+    let completed = fields.next().and_then(|value| value.parse::<u64>().ok());
+    let stats = fields.next().unwrap_or_default();
+    let (current, rate) = parse_cstream_stats(stats)
+        .map(|(current, rate)| (Some(current), Some(rate)))
+        .unwrap_or_default();
+    let _ = update_recovery_operation(job_id, |operation| {
+        operation.disk_index = index.or(operation.disk_index);
+        operation.telemetry_available = current.is_some();
+        operation.transferred_bytes = match (completed, current) {
+            (Some(done), Some(value)) => Some(done.saturating_add(value)),
+            _ => operation.transferred_bytes,
+        };
+        operation.bytes_per_second = rate;
+        operation.eta_seconds = match (operation.estimated_bytes, operation.transferred_bytes, rate)
+        {
+            (Some(total), Some(done), Some(rate)) if rate > 0 && total > done => {
+                Some((total - done) / rate)
+            }
+            _ => None,
+        };
+    });
+}
+
+fn parse_cstream_stats(stats: &str) -> Option<(u64, u64)> {
+    let tokens: Vec<&str> = stats.split_whitespace().collect();
+    Some((tokens.first()?.parse().ok()?, tokens.get(6)?.parse().ok()?))
+}
+
+fn run_ssh_script_streaming_checked(
+    remote: &str,
+    node: &str,
+    user: &str,
+    ssh_private_key: &str,
+    script: &str,
+    job_id: &str,
+) -> Result<String, Error> {
+    let (host, port) = resolve_node_host(remote, node)?;
+    let host = normalize_host_for_connection(&host);
+    let mut command = Command::new("ssh");
+    command
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new")
+        .arg("-i")
+        .arg(ssh_private_key);
+    if let Some(port) = normalize_ssh_port(port) {
+        command.arg("-p").arg(port.to_string());
+    }
+    command
+        .arg(format!("{user}@{host}"))
+        .arg("--")
+        .arg("/bin/bash")
+        .arg("-lc")
+        .arg(shell_escape(script))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to execute ssh against '{remote}/{node}'"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed to capture ssh stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("failed to capture ssh stderr")?;
+    let (sender, receiver) = mpsc::channel();
+    for (is_stderr, reader) in [
+        (false, Box::new(stdout) as Box<dyn std::io::Read + Send>),
+        (true, Box::new(stderr) as Box<dyn std::io::Read + Send>),
+    ] {
+        let sender = sender.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(reader).lines().map_while(Result::ok) {
+                let _ = sender.send((is_stderr, line));
+            }
+        });
+    }
+    drop(sender);
+
+    let mut output = String::new();
+    for (_is_stderr, line) in receiver {
+        parse_recovery_stream_line(job_id, &line);
+        if !line.starts_with("PDM_CSTREAM:") && !line.starts_with("PDM_ESTIMATE:") {
+            println!("{line}");
+            output.push_str(&line);
+            output.push('\n');
+        }
+    }
+    let status = child.wait()?;
+    if !status.success() {
+        bail!(
+            "{}",
+            if output.trim().is_empty() {
+                format!("ssh command against '{remote}/{node}' failed")
+            } else {
+                output.trim().to_string()
+            }
+        );
+    }
+    Ok(output)
 }
 
 fn ssh_prepare_step(name: &str, ok: bool, message: String) -> OffsiteSshPrepareStep {
@@ -2006,6 +2274,7 @@ fn remove_local_job_artifacts(job_id: &str) -> Result<(), Error> {
         recovery_point_catalog_path(job_id),
         lifecycle_state_path(job_id),
         failover_record_path(job_id),
+        recovery_operation_path(job_id),
     ] {
         if let Err(err) = std::fs::remove_file(&file) {
             if err.kind() != std::io::ErrorKind::NotFound {
@@ -3379,10 +3648,21 @@ fn build_incremental_failback_send_script(
     staging_dataset: &str,
     source_port_args: &str,
     source_ssh: &str,
+    disk_index: usize,
+    disk_count: usize,
 ) -> String {
     format!(
-        "origin=$(zfs get -H -o value origin \"$dataset\")\nparent=${{origin%@*}}\nbase=${{origin##*@}}\nrestore_origin() {{\n  if [ \"$(zfs get -H -o value origin \"$parent\")\" != '-' ]; then\n    zfs promote \"$parent\"\n  fi\n}}\nzfs promote \"$dataset\"\ntrap 'restore_origin || true' EXIT\necho {}\nif ! zfs send -w -i \"$dataset@$base\" \"$dataset@{}\" | ssh -i {} -o BatchMode=yes{} {} -- zfs recv -u -F {}; then\n  restore_origin || true\n  trap - EXIT\n  exit 1\nfi\nrestore_origin\ntrap - EXIT\n",
+        "origin=$(zfs get -H -o value origin \"$dataset\")\nparent=${{origin%@*}}\nbase=${{origin##*@}}\nrestore_origin() {{\n  if [ \"$(zfs get -H -o value origin \"$parent\")\" != '-' ]; then\n    zfs promote \"$parent\"\n  fi\n}}\nzfs promote \"$dataset\"\ntrap 'restore_origin || true' EXIT\nestimate=$(zfs send -nP -w -i \"$dataset@$base\" \"$dataset@{}\" 2>&1 | awk '/size[[:space:]]/ {{print $2; exit}}')\nestimate=${{estimate:-0}}\nprintf 'PDM_ESTIMATE:{}:{}:%s:%s\\n' \"$estimate\" \"$pdm_completed\" >&2\necho {}\nif command -v cstream >/dev/null 2>&1; then\n  if [ \"$estimate\" -gt 0 ]; then meter_args=(-n \"$estimate\"); else meter_args=(); fi\n  if ! zfs send -w -i \"$dataset@$base\" \"$dataset@{}\" | cstream -v 1 -T 1 \"${{meter_args[@]}}\" 2> >(sed -u \"s/^/PDM_CSTREAM:{}:$pdm_completed:/\" >&2) | ssh -i {} -o BatchMode=yes{} {} -- zfs recv -u -F {}; then\n    restore_origin || true\n    trap - EXIT\n    exit 1\n  fi\nelse\n  zfs send -w -i \"$dataset@$base\" \"$dataset@{}\" | ssh -i {} -o BatchMode=yes{} {} -- zfs recv -u -F {}\nfi\npdm_completed=$((pdm_completed + estimate))\nrestore_origin\ntrap - EXIT\n",
+        snapshot_tag,
+        disk_index,
+        disk_count,
         shell_escape(&format!("incremental failback staging to {staging_dataset}")),
+        snapshot_tag,
+        disk_index,
+        shell_escape(&job.ssh_private_key),
+        source_port_args,
+        source_ssh,
+        shell_escape(staging_dataset),
         snapshot_tag,
         shell_escape(&job.ssh_private_key),
         source_port_args,
@@ -3654,6 +3934,7 @@ fn execute_failback(
         bail!("failback is currently implemented only for QEMU guests");
     }
 
+    set_recovery_phase(&job.id, "Prechecking failback");
     let precheck = failback_precheck_inner(job, request)?;
     validate_failback_execution_precheck(job, request, &precheck)?;
 
@@ -3686,6 +3967,7 @@ fn execute_failback(
         incremental_transfer,
         &token,
     )?;
+    set_recovery_phase(&job.id, "Preparing source staging");
     let prepare_output = run_ssh_script_checked(
         &job.source_remote,
         &job.source_node,
@@ -3694,12 +3976,14 @@ fn execute_failback(
         &prepare_script,
     )?;
 
-    let mut transfer_script = String::from("set -euo pipefail\n");
+    let mut transfer_script = String::from("set -euo pipefail\npdm_completed=0\n");
     transfer_script.push_str(&format!(
         "if qm status {} 2>/dev/null | grep -q 'status: running'; then\n  qm shutdown {} --timeout 60 >/dev/null 2>&1 || true\n  qm status {} 2>/dev/null | grep -q 'status: running' && qm stop {}\nfi\n",
         request.recovery_vmid, request.recovery_vmid, request.recovery_vmid, request.recovery_vmid,
     ));
-    for disk in &parsed.disks {
+    let disk_count = parsed.disks.len();
+    for (disk_offset, disk) in parsed.disks.iter().enumerate() {
+        let disk_index = disk_offset + 1;
         let promoted_disk = matching_disk(&promoted.disks, &disk.key, "promoted recovery guest")?;
         let destination_dataset = source_restore_dataset(
             &record,
@@ -3720,11 +4004,17 @@ fn execute_failback(
                 &staging_dataset,
                 &source_port_args,
                 &source_ssh,
+                disk_index,
+                disk_count,
             ));
         } else {
             transfer_script.push_str(&format!(
-                "echo {}\nzfs send -w \"$dataset@{snapshot_tag}\" | ssh -i {} -o BatchMode=yes{} {} -- zfs recv -u -F {}\n",
+                "estimate=$(zfs send -nP -w \"$dataset@{snapshot_tag}\" 2>&1 | awk '/size[[:space:]]/ {{print $2; exit}}')\nestimate=${{estimate:-0}}\nprintf 'PDM_ESTIMATE:{disk_index}:{disk_count}:%s:%s\\n' \"$estimate\" \"$pdm_completed\" >&2\necho {}\nif command -v cstream >/dev/null 2>&1; then\n  if [ \"$estimate\" -gt 0 ]; then meter_args=(-n \"$estimate\"); else meter_args=(); fi\n  zfs send -w \"$dataset@{snapshot_tag}\" | cstream -v 1 -T 1 \"${{meter_args[@]}}\" 2> >(sed -u \"s/^/PDM_CSTREAM:{disk_index}:$pdm_completed:/\" >&2) | ssh -i {} -o BatchMode=yes{} {} -- zfs recv -u -F {}\nelse\n  zfs send -w \"$dataset@{snapshot_tag}\" | ssh -i {} -o BatchMode=yes{} {} -- zfs recv -u -F {}\nfi\npdm_completed=$((pdm_completed + estimate))\n",
                 shell_escape(&format!("full failback staging to {staging_dataset}")),
+                shell_escape(&job.ssh_private_key),
+                source_port_args,
+                source_ssh,
+                shell_escape(&staging_dataset),
                 shell_escape(&job.ssh_private_key),
                 source_port_args,
                 source_ssh,
@@ -3733,12 +4023,14 @@ fn execute_failback(
         }
     }
 
-    let transfer_output = match run_ssh_script_checked(
+    set_recovery_phase(&job.id, "Transferring disks");
+    let transfer_output = match run_ssh_script_streaming_checked(
         &job.target_remote,
         &job.target_node,
         &job.target_user,
         &job.ssh_private_key,
         &transfer_script,
+        &job.id,
     ) {
         Ok(output) => output,
         Err(err) => {
@@ -3757,6 +4049,7 @@ fn execute_failback(
             return Err(err);
         }
     };
+    set_recovery_phase(&job.id, "Cutting over source datasets");
     let cutover_script =
         build_failback_cutover_script(job, request, &record, &parsed, &metadata, &token)?;
     let cutover_output = run_ssh_script_checked(
@@ -3766,6 +4059,7 @@ fn execute_failback(
         &job.ssh_private_key,
         &cutover_script,
     )?;
+    set_recovery_phase(&job.id, "Registering source guest");
     let register_script = build_failback_register_script(job, request, &parsed)?;
     let register_output = run_ssh_script_checked(
         &job.source_remote,
@@ -3775,6 +4069,14 @@ fn execute_failback(
         &register_script,
     )?;
 
+    set_recovery_phase(
+        &job.id,
+        if request.cleanup_target {
+            "Cleaning promoted target"
+        } else {
+            "Retaining promoted target"
+        },
+    );
     let cleanup_output = if request.cleanup_target {
         let cleanup_script = format!(
             "set -euo pipefail\nqm destroy {} --purge 1\n",
@@ -3793,6 +4095,7 @@ fn execute_failback(
 
     let mut combined_output =
         format!("{prepare_output}\n{transfer_output}\n{cutover_output}\n{register_output}\n{cleanup_output}");
+    set_recovery_phase(&job.id, "Repairing protection");
     let suspend_reason = if request.cleanup_target {
         match attempt_protection_repair(job, &repair_plan, request.allow_full) {
             Ok(repair_output) => {
@@ -4750,6 +5053,24 @@ pub fn run_failover_now(
     let pending_record_id = format!("{}-{}-pending", sanitize_id(&job.id), request.recovery_vmid);
     // Reserve the lifecycle before starting the worker so the scheduler cannot race promotion.
     suspend_replication_job(&job.id, &pending_record_id)?;
+    let now = proxmox_time::epoch_i64();
+    if let Err(err) = save_recovery_operation(
+        &job.id,
+        &OffsiteRecoveryOperationStatus {
+            kind: OffsiteRecoveryOperationKind::Promote,
+            state: OffsiteRecoveryOperationState::Submitting,
+            phase: "Submitting promotion".to_string(),
+            start_time: now,
+            updated_time: now,
+            recovery_vmid: request.recovery_vmid,
+            snapshot: Some(request.snapshot.clone()),
+            recovered_name: request.recovered_name.clone(),
+            ..Default::default()
+        },
+    ) {
+        resume_replication_job(&job.id)?;
+        return Err(err);
+    }
     drop(replication_guard);
     drop(config_lock);
 
@@ -4766,6 +5087,8 @@ pub fn run_failover_now(
                 request.snapshot
             );
 
+            set_recovery_phase(&job.id, "Preparing target guest");
+
             let output = match execute_failover(&job, &request) {
                 Ok(output) => output,
                 Err(err) => {
@@ -4775,16 +5098,19 @@ pub fn run_failover_now(
                             job.id
                         );
                     }
+                    finish_recovery_operation(&job.id, false, Some(err.to_string()));
                     return Err(err);
                 }
             };
+            set_recovery_phase(&job.id, "Finalizing promotion");
             let failover_time = proxmox_time::epoch_i64();
             let record_id = format!(
                 "{}-{}-{failover_time}",
                 sanitize_id(&job.id),
                 request.recovery_vmid
             );
-            save_failover_record(OffsiteFailoverRecord {
+            let finalize = (|| -> Result<(), Error> {
+                save_failover_record(OffsiteFailoverRecord {
                 record_id: record_id.clone(),
                 job_id: job.id.clone(),
                 source_snapshot: request.snapshot.clone(),
@@ -4803,20 +5129,38 @@ pub fn run_failover_now(
                 lineage: OffsiteFailbackLineage::Unchecked,
                 last_checked: None,
                 status_message: None,
-            })?;
-            suspend_replication_job(&job.id, &record_id)?;
+                })?;
+                suspend_replication_job(&job.id, &record_id)
+            })();
+            if let Err(err) = finalize {
+                finish_recovery_operation(&job.id, false, Some(err.to_string()));
+                return Err(err);
+            }
             if !output.trim().is_empty() {
                 for line in output.lines() {
                     println!("{line}");
                 }
             }
 
+            finish_recovery_operation(&job.id, true, None);
+
             Ok(())
         },
     );
 
-    if result.is_err() {
-        resume_replication_job(&job_id)?;
+    match &result {
+        Ok(upid) => {
+            update_recovery_operation(&job_id, |operation| {
+                operation.upid = Some(upid.clone());
+                if operation.state == OffsiteRecoveryOperationState::Submitting {
+                    operation.state = OffsiteRecoveryOperationState::Running;
+                }
+            })?;
+        }
+        Err(err) => {
+            resume_replication_job(&job_id)?;
+            finish_recovery_operation(&job_id, false, Some(err.to_string()));
+        }
     }
     result
 }
@@ -4841,8 +5185,25 @@ pub fn run_failback_now(
     })?;
     let worker_id = Some(worker_name);
     let auth_id = auth_id.to_string();
+    let now = proxmox_time::epoch_i64();
+    save_recovery_operation(
+        &job.id,
+        &OffsiteRecoveryOperationStatus {
+            kind: OffsiteRecoveryOperationKind::Failback,
+            state: OffsiteRecoveryOperationState::Submitting,
+            phase: "Submitting failback".to_string(),
+            start_time: now,
+            updated_time: now,
+            recovery_vmid: request.recovery_vmid,
+            restore_vmid: Some(request.restore_vmid),
+            recovered_name: request.recovered_name.clone(),
+            cleanup_target: request.cleanup_target,
+            ..Default::default()
+        },
+    )?;
+    let job_id = job.id.clone();
 
-    WorkerTask::new_thread(
+    let result = WorkerTask::new_thread(
         FAILBACK_WORKER_TYPE,
         worker_id,
         auth_id,
@@ -4855,23 +5216,46 @@ pub fn run_failback_now(
                 request.recovery_vmid
             );
 
-            let result = execute_failback(&job, &request)?;
-            mark_failback_complete(
+            set_recovery_phase(&job.id, "Prechecking failback");
+            let result = match execute_failback(&job, &request) {
+                Ok(result) => result,
+                Err(err) => {
+                    finish_recovery_operation(&job.id, false, Some(err.to_string()));
+                    return Err(err);
+                }
+            };
+            set_recovery_phase(&job.id, "Finalizing failback");
+            if let Err(err) = mark_failback_complete(
                 &job.id,
                 request.recovery_vmid,
                 request.restore_vmid,
                 result.target_cleaned,
                 result.suspend_reason.clone(),
-            )?;
+            ) {
+                finish_recovery_operation(&job.id, false, Some(err.to_string()));
+                return Err(err);
+            }
             if !result.output.trim().is_empty() {
                 for line in result.output.lines() {
                     println!("{line}");
                 }
             }
 
+            finish_recovery_operation(&job.id, true, result.suspend_reason.clone());
+
             Ok(())
         },
-    )
+    );
+    match &result {
+        Ok(upid) => update_recovery_operation(&job_id, |operation| {
+            operation.upid = Some(upid.clone());
+            if operation.state == OffsiteRecoveryOperationState::Submitting {
+                operation.state = OffsiteRecoveryOperationState::Running;
+            }
+        })?,
+        Err(err) => finish_recovery_operation(&job_id, false, Some(err.to_string())),
+    }
+    result
 }
 
 pub fn run_due_jobs() -> Result<(), Error> {
@@ -4908,6 +5292,15 @@ mod tests {
     use super::*;
     use pdm_api_types::resource::GuestType;
     use pdm_api_types::OffsiteZfsStreamMode;
+
+    #[test]
+    fn test_parse_cstream_periodic_stats() {
+        assert_eq!(
+            parse_cstream_stats("1007616 B 1.0 MB 1.00 s 1007447 B/s 0.96 MB/s"),
+            Some((1_007_616, 1_007_447)),
+        );
+        assert_eq!(parse_cstream_stats("not a progress line"), None);
+    }
 
     fn sample_job(guest_type: GuestType) -> OffsiteReplicationJob {
         OffsiteReplicationJob {
@@ -5079,6 +5472,8 @@ mod tests {
             "tank/vmdata/pdm-failback-test-vm-100-disk-0",
             " -p 22",
             "root@source.example",
+            1,
+            1,
         );
 
         let promote_recovery = script
@@ -5094,6 +5489,9 @@ mod tests {
         assert!(send < restore_parent);
         assert!(script.contains("trap 'restore_origin || true' EXIT"));
         assert!(script.contains("zfs promote \"$parent\""));
+        assert!(script.contains("PDM_ESTIMATE:1:1"));
+        assert!(script.contains("cstream -v 1 -T 1"));
+        assert!(script.contains("PDM_CSTREAM:1:$pdm_completed"));
     }
 
     #[test]

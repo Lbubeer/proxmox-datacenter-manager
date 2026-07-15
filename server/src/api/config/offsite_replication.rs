@@ -9,9 +9,10 @@ use pdm_api_types::{
     verify_offsite_recovered_name, verify_offsite_snapshot, verify_offsite_ssh_key_path,
     verify_offsite_ssh_user, verify_offsite_target_dataset, Authid, ConfigDigest,
     OffsiteFailbackPrecheck, OffsiteFailbackRequest, OffsiteFailoverRecord, OffsiteFailoverRequest,
-    OffsiteRecoveryPoint, OffsiteReplicationJob, OffsiteReplicationJobStatus,
-    OffsiteReplicationJobUpdater, OffsiteReplicationRun, OffsiteSshKeygenRequest,
-    OffsiteSshKeygenResult, OffsiteSshPrepareRequest, OffsiteSshPrepareResult,
+    OffsiteRecoveryOperationStatus, OffsiteRecoveryPoint, OffsiteReplicationJob,
+    OffsiteReplicationJobStatus, OffsiteReplicationJobUpdater, OffsiteReplicationRun,
+    OffsiteSshKeygenRequest, OffsiteSshKeygenResult, OffsiteSshPrepareRequest,
+    OffsiteSshPrepareResult,
     OFFSITE_REPLICATION_HISTORY_LIMIT_SCHEMA, OFFSITE_REPLICATION_ID_SCHEMA,
     OFFSITE_REPLICATION_SNAPSHOT_SCHEMA, PRIV_RESOURCE_AUDIT, PRIV_RESOURCE_MANAGE,
     PROXMOX_SAFE_ID_REGEX,
@@ -47,6 +48,12 @@ const ITEM_SUBDIRS: SubdirMap = &sorted!([
     (
         "recovery-points",
         &Router::new().get(&API_METHOD_LIST_RECOVERY_POINTS)
+    ),
+    (
+        "recovery-operation",
+        &Router::new()
+            .get(&API_METHOD_READ_RECOVERY_OPERATION)
+            .post(&API_METHOD_ACKNOWLEDGE_RECOVERY_OPERATION)
     ),
     (
         "resume",
@@ -501,6 +508,60 @@ fn list_recovery_points(
     check_source_guest_privs(rpcenv, job, PRIV_RESOURCE_AUDIT)?;
     check_target_remote_privs(rpcenv, &job.target_remote, PRIV_RESOURCE_AUDIT)?;
     crate::offsite_replication::list_recovery_points(job)
+}
+
+#[api(
+    protected: true,
+    input: {
+        properties: {
+            id: { schema: OFFSITE_REPLICATION_ID_SCHEMA },
+        },
+    },
+    access: {
+        permission: &Permission::Privilege(&["resource"], PRIV_RESOURCE_AUDIT, true),
+    },
+    returns: {
+        type: OffsiteRecoveryOperationStatus,
+        optional: true,
+    },
+)]
+/// Read the latest durable recovery operation for a job.
+fn read_recovery_operation(
+    id: String,
+    rpcenv: &mut dyn RpcEnvironment,
+) -> Result<Option<OffsiteRecoveryOperationStatus>, Error> {
+    let (config, _) = pdm_config::offsite_replication::config()?;
+    let Some(job) = find_job(&config.jobs, &id) else {
+        http_bail!(NOT_FOUND, "job '{}' does not exist", id);
+    };
+    check_source_guest_privs(rpcenv, job, PRIV_RESOURCE_AUDIT)?;
+    check_target_remote_privs(rpcenv, &job.target_remote, PRIV_RESOURCE_AUDIT)?;
+    crate::offsite_replication::recovery_operation_status(&id)
+}
+
+#[api(
+    protected: true,
+    input: {
+        properties: {
+            id: { schema: OFFSITE_REPLICATION_ID_SCHEMA },
+        },
+    },
+    access: {
+        permission: &Permission::Privilege(&["resource"], PRIV_RESOURCE_MANAGE, true),
+    },
+)]
+/// Mark a successfully reconciled recovery operation complete.
+fn acknowledge_recovery_operation(
+    id: String,
+    rpcenv: &mut dyn RpcEnvironment,
+) -> Result<(), Error> {
+    let (config, _) = pdm_config::offsite_replication::config()?;
+    let Some(job) = find_job(&config.jobs, &id) else {
+        http_bail!(NOT_FOUND, "job '{}' does not exist", id);
+    };
+    check_source_guest_privs(rpcenv, job, PRIV_RESOURCE_MANAGE)?;
+    check_target_remote_privs(rpcenv, &job.target_remote, PRIV_RESOURCE_MANAGE)?;
+    crate::offsite_replication::acknowledge_recovery_operation(&id)
 }
 
 #[api(
