@@ -18,8 +18,8 @@ use pwt::state::{Selection, Store};
 use pwt::widget::data_table::{DataTable, DataTableColumn, DataTableHeader};
 use pwt::widget::form::{Checkbox, Combobox, DisplayField, Field, FormContext};
 use pwt::widget::{
-    Button, ButtonType, Column, ConfirmDialog, Container, Dialog, Fa, InputPanel, List, ListTile,
-    Panel, Row, TabBarItem, TabPanel, Toolbar, Trigger,
+    ActionIcon, Button, ButtonType, Column, ConfirmDialog, Container, Dialog, Fa, InputPanel, List,
+    ListTile, Panel, Row, TabBarItem, TabPanel, Toolbar, Tooltip, Trigger,
 };
 
 use proxmox_schema::IntegerSchema;
@@ -33,10 +33,10 @@ use proxmox_yew_comp::{
 };
 
 use pdm_api_types::remotes::RemoteType;
-use pdm_api_types::resource::GuestType;
+use pdm_api_types::resource::{GuestType, RemoteResources, Resource};
 use pdm_api_types::{
-    OffsiteFailbackLineage, OffsiteFailbackPrecheck, OffsiteFailbackRequest,
-    OffsiteFailbackRestoreMode, OffsiteFailoverLifecycle, OffsiteFailoverRecord,
+    OffsiteFailbackLineage, OffsiteFailbackPrecheck, OffsiteFailbackRepairMode,
+    OffsiteFailbackRequest, OffsiteFailoverLifecycle, OffsiteFailoverRecord,
     OffsiteFailoverRequest, OffsiteGuestState, OffsiteRecoveryPoint, OffsiteReplicationJob,
     OffsiteReplicationJobStatus, OffsiteReplicationRun, OffsiteSshKeygenRequest,
     OffsiteSshKeygenResult, OffsiteSshPrepareRequest, OffsiteSshPrepareResult,
@@ -44,7 +44,9 @@ use pdm_api_types::{
     OFFSITE_REPLICATION_MAXSNAP_SCHEMA, OFFSITE_REPLICATION_SCHEDULE_SCHEMA,
 };
 
-use crate::renderer::status_row;
+use crate::get_deep_url;
+use crate::pve::utils::guest_status_label;
+use crate::renderer::{render_status_icon, status_row};
 use crate::widget::{PveGuestSelector, PveNodeSelector, RemoteSelector};
 
 const BASE_URL: &str = "/config/offsite-replication";
@@ -57,6 +59,7 @@ const TAB_FAILOVER: &str = "failover";
 const HISTORY_PAGE_SIZE: usize = 200;
 const HISTORY_GRAPH_POINTS: usize = 6;
 const AUTO_REFRESH_MS: u32 = 30_000;
+const PLACEMENT_REFRESH_MS: u32 = 10_000;
 const DEFAULT_JOB_SCHEDULE: &str = "*:0/5";
 const DEFAULT_MAX_SNAPSHOTS: &str = "4";
 const DEFAULT_HISTORY_LIMIT: &str = "200";
@@ -97,6 +100,7 @@ pub enum ViewState {
     PickHistoryJob,
     PickFailoverJob,
     PickRunNowJob,
+    ConfirmFailover(bool),
     ConfirmFailback(bool),
     ConfirmAbandonFailover,
 }
@@ -135,6 +139,13 @@ pub enum Msg {
     HistoryLoaded(String, usize, Result<Vec<OffsiteReplicationRun>, Error>),
     RecoveryPointsLoaded(String, Result<Vec<OffsiteRecoveryPoint>, Error>),
     FailoverRecordsLoaded(String, Result<Vec<OffsiteFailoverRecord>, Error>),
+    GuestPlacementLoaded(String, Result<Vec<RemoteResources>, Error>),
+    GuestPlacementRefreshed(
+        String,
+        Result<Vec<RemoteResources>, Error>,
+        Result<Vec<OffsiteFailoverRecord>, Error>,
+    ),
+    GuestPlacementRefreshTick,
     RequestFailover(bool),
     TriggerFailover(String, OffsiteFailoverRequest),
     FailoverFinished(Result<String, Error>),
@@ -156,10 +167,10 @@ pub enum Msg {
     UpdateFailoverName(String),
     UpdateFailoverStart(bool),
     UpdateFailbackReplaceSource(bool),
-    UpdateFailbackRestoreMode(String),
     UpdateFailbackRestoreVmid(String),
     UpdateFailbackAllowFull(bool),
     UpdateFailbackCleanupTarget(bool),
+    UpdateFailbackStart(bool),
     FailbackRecordSelected,
     ToggleFailoverAdvanced,
     ResetFailoverDefaults,
@@ -192,6 +203,25 @@ pub enum Msg {
     AutoRefreshTick,
 }
 
+#[derive(Clone, PartialEq)]
+struct RecoveryGuestRow {
+    key: String,
+    role: String,
+    name: String,
+    vmid: u32,
+    status: String,
+    remote: String,
+    node: String,
+    lifecycle: String,
+    resource: Option<Resource>,
+}
+
+impl ExtractPrimaryKey for RecoveryGuestRow {
+    fn extract_key(&self) -> Key {
+        self.key.clone().into()
+    }
+}
+
 fn history_run_key(run: &OffsiteReplicationRun) -> Key {
     format!(
         "{}-{}-{}",
@@ -212,6 +242,33 @@ fn failover_record_key(record: &OffsiteFailoverRecord) -> Key {
     } else {
         record.record_id.clone().into()
     }
+}
+
+fn failover_records_live_state(
+    records: &[OffsiteFailoverRecord],
+) -> Vec<(
+    String,
+    OffsiteFailoverLifecycle,
+    OffsiteGuestState,
+    OffsiteGuestState,
+    OffsiteFailbackLineage,
+    bool,
+    Option<String>,
+)> {
+    records
+        .iter()
+        .map(|record| {
+            (
+                failover_record_key(record).to_string(),
+                record.lifecycle,
+                record.target_guest_state,
+                record.source_guest_state,
+                record.lineage,
+                record.target_cleaned,
+                record.current_name.clone(),
+            )
+        })
+        .collect()
 }
 
 #[derive(Clone, PartialEq, Eq, Ord, PartialOrd)]
@@ -271,6 +328,7 @@ pub struct OffsiteReplicationPanelComp {
     history_requested_limit: usize,
     history_rows_choice: String,
     failover_job_id: Option<String>,
+    loaded_failover_job_id: Option<String>,
     recovery_points_loading: bool,
     recovery_points: Vec<OffsiteRecoveryPoint>,
     recovery_store: Store<OffsiteRecoveryPoint>,
@@ -280,6 +338,11 @@ pub struct OffsiteReplicationPanelComp {
     failover_record_store: Store<OffsiteFailoverRecord>,
     failover_record_selection: Selection,
     failover_record_columns: Rc<Vec<DataTableHeader<OffsiteFailoverRecord>>>,
+    guest_placement_loading: bool,
+    guest_placement_resources: Vec<RemoteResources>,
+    guest_placement_store: Store<RecoveryGuestRow>,
+    guest_placement_columns: Rc<Vec<DataTableHeader<RecoveryGuestRow>>>,
+    guest_placement_timer: Option<Timeout>,
     recovery_filter_text: String,
     recovery_filter_mode: String,
     recovery_filter_recoverable: String,
@@ -298,10 +361,10 @@ pub struct OffsiteReplicationPanelComp {
     failback_last_task: Option<String>,
     failback_precheck: Option<OffsiteFailbackPrecheck>,
     failback_replace_source_guest: bool,
-    failback_restore_mode: OffsiteFailbackRestoreMode,
     failback_restore_vmid_input: String,
     failback_allow_full: bool,
     failback_cleanup_target: bool,
+    failback_start_guest: bool,
     recovery_delete_running: bool,
     recovery_delete_candidate: Option<String>,
     job_picker_filter_text: String,
@@ -583,6 +646,18 @@ impl OffsiteReplicationPanelComp {
                     failback_lineage_text(record.lineage).into()
                 })
                 .into(),
+            DataTableColumn::new(tr!("Target Cleanup"))
+                .width("120px")
+                .render(|record: &OffsiteFailoverRecord| {
+                    if record.target_cleaned {
+                        tr!("Completed").into()
+                    } else if record.lifecycle == OffsiteFailoverLifecycle::Returned {
+                        tr!("Retained").into()
+                    } else {
+                        tr!("Pending").into()
+                    }
+                })
+                .into(),
             DataTableColumn::new(tr!("Target Snapshot"))
                 .flex(2)
                 .render(|record: &OffsiteFailoverRecord| {
@@ -593,6 +668,85 @@ impl OffsiteReplicationPanelComp {
                 .flex(2)
                 .render(|record: &OffsiteFailoverRecord| {
                     snapshot_tail(&record.source_snapshot).into()
+                })
+                .into(),
+        ])
+    }
+
+    fn guest_placement_columns(
+        link: proxmox_yew_comp::LoadableComponentScope<Self>,
+    ) -> Rc<Vec<DataTableHeader<RecoveryGuestRow>>> {
+        Rc::new(vec![
+            DataTableColumn::new(tr!("Role"))
+                .width("150px")
+                .get_property(|row: &RecoveryGuestRow| row.role.as_str())
+                .into(),
+            DataTableColumn::new(tr!("Name"))
+                .flex(2)
+                .get_property(|row: &RecoveryGuestRow| row.name.as_str())
+                .into(),
+            DataTableColumn::new(tr!("VMID"))
+                .width("90px")
+                .render(|row: &RecoveryGuestRow| row.vmid.to_string().into())
+                .into(),
+            DataTableColumn::new(tr!("Status"))
+                .width("130px")
+                .render(|row: &RecoveryGuestRow| {
+                    if let Some(resource) = row.resource.as_ref() {
+                        html! {
+                            <span style="display:flex; align-items:center; gap:6px;">
+                                {render_status_icon(resource)}
+                                {guest_status_label(resource.status())}
+                            </span>
+                        }
+                    } else {
+                        let icon = if row.status == tr!("Missing") {
+                            Fa::new("exclamation-triangle").class(ColorScheme::Warning)
+                        } else {
+                            Fa::new("question-circle").class(ColorScheme::Neutral)
+                        };
+                        html! {
+                            <span style="display:flex; align-items:center; gap:6px;">
+                                {icon}
+                                {row.status.clone()}
+                            </span>
+                        }
+                    }
+                })
+                .into(),
+            DataTableColumn::new(tr!("Remote"))
+                .width("150px")
+                .get_property(|row: &RecoveryGuestRow| row.remote.as_str())
+                .into(),
+            DataTableColumn::new(tr!("Node"))
+                .width("150px")
+                .get_property(|row: &RecoveryGuestRow| row.node.as_str())
+                .into(),
+            DataTableColumn::new(tr!("Lifecycle"))
+                .width("150px")
+                .get_property(|row: &RecoveryGuestRow| row.lifecycle.as_str())
+                .into(),
+            DataTableColumn::new(tr!("Open in PVE"))
+                .width("100px")
+                .justify("right")
+                .render(move |row: &RecoveryGuestRow| {
+                    let Some(resource) = row.resource.as_ref() else {
+                        return html! {};
+                    };
+                    let Some(url) =
+                        get_deep_url(&link, &row.remote, Some(&row.node), &resource.id())
+                    else {
+                        return html! {};
+                    };
+                    Tooltip::new(
+                        ActionIcon::new("fa fa-fw fa-external-link")
+                            .aria_label(tr!("Open in PVE UI"))
+                            .on_activate(move |_| {
+                                let _ = gloo_utils::window().open_with_url(&url.href());
+                            }),
+                    )
+                    .tip(tr!("Open in PVE UI"))
+                    .into()
                 })
                 .into(),
         ])
@@ -712,6 +866,210 @@ impl OffsiteReplicationPanelComp {
         }));
     }
 
+    fn schedule_guest_placement_refresh(&mut self, ctx: &LoadableComponentContext<Self>) {
+        if self.current_tab() != TAB_FAILOVER || self.guest_placement_timer.is_some() {
+            return;
+        }
+
+        let link = ctx.link().clone();
+        self.guest_placement_timer = Some(Timeout::new(PLACEMENT_REFRESH_MS, move || {
+            link.send_message(Msg::GuestPlacementRefreshTick);
+        }));
+    }
+
+    fn load_guest_placement(&mut self, id: String, ctx: &LoadableComponentContext<Self>) {
+        if self.guest_placement_loading {
+            return;
+        }
+        self.guest_placement_loading = true;
+        let link = ctx.link().clone();
+        ctx.link().spawn(async move {
+            let resources = crate::pdm_client().resources(None, None).await;
+            link.send_message(Msg::GuestPlacementLoaded(id, resources));
+        });
+    }
+
+    fn refresh_guest_placement(&mut self, id: String, ctx: &LoadableComponentContext<Self>) {
+        if self.guest_placement_loading || self.failover_records_loading {
+            return;
+        }
+        self.guest_placement_loading = true;
+        self.failover_records_loading = true;
+        let link = ctx.link().clone();
+        ctx.link().spawn(async move {
+            let records_id = id.clone();
+            let resources_future = crate::pdm_client().resources(None, None);
+            let records_future = async move {
+                let path = format!(
+                    "{BASE_URL}/{}/failover-records",
+                    percent_encode_component(&records_id)
+                );
+                http_get(&path, None).await
+            };
+            let (resources, records) = futures::join!(resources_future, records_future);
+            link.send_message(Msg::GuestPlacementRefreshed(id, resources, records));
+        });
+    }
+
+    fn rebuild_guest_placement(&mut self) {
+        let Some(job) = self.selected_failover_job() else {
+            self.guest_placement_store.set_data(Vec::new());
+            return;
+        };
+
+        let remote_failed = |remote: &str| {
+            self.guest_placement_resources
+                .iter()
+                .find(|entry| entry.remote == remote)
+                .map_or(true, |entry| entry.error.is_some())
+        };
+        let find_guest = |remote: &str, vmid: u32| {
+            self.guest_placement_resources
+                .iter()
+                .find(|entry| entry.remote == remote)
+                .filter(|entry| entry.error.is_none())
+                .and_then(|entry| {
+                    entry.resources.iter().find(|resource| {
+                        resource_guest_vmid(resource) == Some(vmid)
+                            && resource_matches_guest_type(resource, job.job.guest_type)
+                    })
+                })
+                .cloned()
+        };
+
+        let source_resource = find_guest(&job.job.source_remote, job.job.vmid);
+        let source_unknown = source_resource.is_none() && remote_failed(&job.job.source_remote);
+        let latest_record = self.failover_records.first();
+        let source_status = source_resource
+            .as_ref()
+            .map(|resource| guest_status_label(resource.status()))
+            .unwrap_or_else(|| {
+                if source_unknown {
+                    tr!("Unknown")
+                } else {
+                    tr!("Missing")
+                }
+            });
+        let source_name = source_resource
+            .as_ref()
+            .map(|resource| resource.name().to_string())
+            .unwrap_or_else(|| format!("{} {}", guest_type_text(job.job.guest_type), job.job.vmid));
+        let source_lifecycle = if self
+            .failover_records
+            .iter()
+            .any(|record| record.lifecycle == OffsiteFailoverLifecycle::Active)
+        {
+            tr!("Original Source")
+        } else if latest_record
+            .is_some_and(|record| record.lifecycle == OffsiteFailoverLifecycle::Returned)
+        {
+            tr!("Returned to Source")
+        } else {
+            tr!("Protected")
+        };
+
+        let mut rows = vec![RecoveryGuestRow {
+            key: "source".to_string(),
+            role: tr!("Source"),
+            name: source_name,
+            vmid: job.job.vmid,
+            status: source_status,
+            remote: job.job.source_remote.clone(),
+            node: source_resource
+                .as_ref()
+                .and_then(resource_guest_node)
+                .unwrap_or_else(|| job.job.source_node.clone()),
+            lifecycle: source_lifecycle,
+            resource: source_resource,
+        }];
+
+        for record in self
+            .failover_records
+            .iter()
+            .filter(|record| record.lifecycle == OffsiteFailoverLifecycle::Active)
+        {
+            let resource = find_guest(&job.job.target_remote, record.recovery_vmid);
+            let target_unknown = resource.is_none() && remote_failed(&job.job.target_remote);
+            let status = resource
+                .as_ref()
+                .map(|resource| guest_status_label(resource.status()))
+                .unwrap_or_else(|| {
+                    if target_unknown || record.target_guest_state == OffsiteGuestState::Unknown {
+                        tr!("Unknown")
+                    } else {
+                        tr!("Missing")
+                    }
+                });
+            rows.push(RecoveryGuestRow {
+                key: format!("target-{}", failover_record_key(record)),
+                role: tr!("Promoted Target"),
+                name: resource
+                    .as_ref()
+                    .map(|resource| resource.name().to_string())
+                    .or_else(|| record.current_name.clone())
+                    .or_else(|| record.recovered_name.clone())
+                    .unwrap_or_else(|| format!("VM {}", record.recovery_vmid)),
+                vmid: record.recovery_vmid,
+                status,
+                remote: job.job.target_remote.clone(),
+                node: resource
+                    .as_ref()
+                    .and_then(resource_guest_node)
+                    .unwrap_or_else(|| job.job.target_node.clone()),
+                lifecycle: failover_lifecycle_text(record.lifecycle),
+                resource,
+            });
+        }
+
+        self.guest_placement_store.set_data(rows);
+    }
+
+    fn guest_placement_live_state(&self) -> Vec<(String, String, String, String, String, String)> {
+        self.guest_placement_store
+            .read()
+            .data()
+            .iter()
+            .map(|row| {
+                (
+                    row.key.clone(),
+                    row.name.clone(),
+                    row.status.clone(),
+                    row.remote.clone(),
+                    row.node.clone(),
+                    row.lifecycle.clone(),
+                )
+            })
+            .collect()
+    }
+
+    fn source_guest_is_running(&self) -> bool {
+        self.guest_placement_store.read().data().iter().any(|row| {
+            row.key == "source"
+                && row
+                    .resource
+                    .as_ref()
+                    .is_some_and(|r| r.status() == "running")
+        })
+    }
+
+    fn source_guest_is_missing(&self) -> bool {
+        self.guest_placement_store
+            .read()
+            .data()
+            .iter()
+            .any(|row| row.key == "source" && row.status == tr!("Missing"))
+    }
+
+    fn promoted_guest_is_running(&self) -> bool {
+        self.guest_placement_store.read().data().iter().any(|row| {
+            row.key.starts_with("target-")
+                && row
+                    .resource
+                    .as_ref()
+                    .is_some_and(|r| r.status() == "running")
+        })
+    }
+
     fn refresh_active_tab(&mut self, ctx: &LoadableComponentContext<Self>) {
         match self.current_tab().as_str() {
             TAB_METRICS => {
@@ -730,7 +1088,7 @@ impl OffsiteReplicationPanelComp {
                     .clone()
                     .or_else(|| self.default_job_id())
                 {
-                    self.load_failover_for_job_id(id, ctx);
+                    self.refresh_guest_placement(id, ctx);
                 }
             }
             _ => ctx.link().send_reload(),
@@ -1033,25 +1391,32 @@ impl OffsiteReplicationPanelComp {
             store.lookup_record(&id.clone().into()).cloned()
         };
         if let Some(rec) = rec {
-            let job_changed = self.failover_job_id.as_deref() != Some(id.as_str());
+            let job_changed = self.loaded_failover_job_id.as_deref() != Some(id.as_str());
             self.failover_job_id = Some(id.clone());
-            if job_changed || !self.failover_form_dirty {
+            self.loaded_failover_job_id = Some(id.clone());
+            if job_changed {
                 self.set_failover_defaults_for_job(&rec);
+                self.set_failback_defaults_for_job(&rec);
+            } else {
+                self.sync_failback_restore_vmid_for_job(&rec);
             }
             if job_changed {
                 self.failover_running = false;
                 self.failover_last_task = None;
                 self.failback_running = false;
                 self.failback_last_task = None;
-                self.failback_precheck = None;
+                self.guest_placement_store.set_data(Vec::new());
+                self.recovery_points.clear();
+                self.recovery_store.set_data(Vec::new());
+                self.recovery_view_store.set_data(Vec::new());
+                self.failover_records.clear();
+                self.failover_record_store.set_data(Vec::new());
             }
             self.recovery_points_loading = true;
-            self.failover_records_loading = true;
-            self.recovery_points.clear();
-            self.recovery_store.set_data(Vec::new());
-            self.recovery_view_store.set_data(Vec::new());
-            self.failover_records.clear();
-            self.failover_record_store.set_data(Vec::new());
+            let load_records = !self.failover_records_loading;
+            if load_records {
+                self.failover_records_loading = true;
+            }
 
             let recovery_id = id.clone();
             let link = ctx.link().clone();
@@ -1064,16 +1429,21 @@ impl OffsiteReplicationPanelComp {
                 link.send_message(Msg::RecoveryPointsLoaded(recovery_id, points));
             });
 
-            let records_id = id;
-            let link = ctx.link().clone();
-            ctx.link().spawn(async move {
-                let path = format!(
-                    "{BASE_URL}/{}/failover-records",
-                    percent_encode_component(&records_id)
-                );
-                let records = http_get(&path, None).await;
-                link.send_message(Msg::FailoverRecordsLoaded(records_id, records));
-            });
+            if load_records {
+                let records_id = id.clone();
+                let link = ctx.link().clone();
+                ctx.link().spawn(async move {
+                    let path = format!(
+                        "{BASE_URL}/{}/failover-records",
+                        percent_encode_component(&records_id)
+                    );
+                    let records = http_get(&path, None).await;
+                    link.send_message(Msg::FailoverRecordsLoaded(records_id, records));
+                });
+            }
+
+            self.load_guest_placement(id.clone(), ctx);
+            self.schedule_guest_placement_refresh(ctx);
         }
     }
 
@@ -1111,11 +1481,24 @@ impl OffsiteReplicationPanelComp {
         self.failover_start_guest = false;
         self.failover_form_dirty = false;
         self.failover_advanced_expanded = false;
-        self.failback_restore_mode = OffsiteFailbackRestoreMode::ReplaceOriginal;
+    }
+
+    fn set_failback_defaults_for_job(&mut self, job: &OffsiteReplicationJobStatus) {
         self.failback_restore_vmid_input = job.job.vmid.to_string();
         self.failback_replace_source_guest = false;
         self.failback_allow_full = false;
         self.failback_cleanup_target = false;
+        self.failback_start_guest = false;
+        self.failback_precheck = None;
+    }
+
+    fn sync_failback_restore_vmid_for_job(&mut self, job: &OffsiteReplicationJobStatus) {
+        self.failback_restore_vmid_input = job.job.vmid.to_string();
+    }
+
+    fn clear_failback_precheck(&mut self) {
+        self.failback_precheck = None;
+        self.failback_replace_source_guest = false;
     }
 
     fn selected_recovery_snapshot(&self) -> Result<String, Error> {
@@ -1203,7 +1586,6 @@ impl OffsiteReplicationPanelComp {
             request: OffsiteFailbackRequest {
                 recovery_vmid: record.recovery_vmid,
                 restore_vmid,
-                restore_mode: self.failback_restore_mode,
                 recovered_name: None,
                 start_guest,
                 allow_full: self.failback_allow_full,
@@ -1435,6 +1817,7 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
             history_requested_limit: HISTORY_PAGE_SIZE,
             history_rows_choice: HISTORY_PAGE_SIZE.to_string(),
             failover_job_id: None,
+            loaded_failover_job_id: None,
             recovery_points_loading: false,
             recovery_points: Vec::new(),
             recovery_store: Store::with_extract_key(|item: &OffsiteRecoveryPoint| {
@@ -1446,6 +1829,11 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
             failover_record_store: Store::with_extract_key(failover_record_key),
             failover_record_selection,
             failover_record_columns: Self::failover_record_columns(),
+            guest_placement_loading: false,
+            guest_placement_resources: Vec::new(),
+            guest_placement_store: Store::new(),
+            guest_placement_columns: Self::guest_placement_columns(ctx.link().clone()),
+            guest_placement_timer: None,
             recovery_filter_text: String::new(),
             recovery_filter_mode: "all".to_string(),
             recovery_filter_recoverable: "all".to_string(),
@@ -1466,10 +1854,10 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
             failback_last_task: None,
             failback_precheck: None,
             failback_replace_source_guest: false,
-            failback_restore_mode: OffsiteFailbackRestoreMode::ReplaceOriginal,
             failback_restore_vmid_input: String::new(),
             failback_allow_full: false,
             failback_cleanup_target: false,
+            failback_start_guest: false,
             recovery_delete_running: false,
             recovery_delete_candidate: None,
             job_picker_filter_text: String::new(),
@@ -1575,29 +1963,34 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                 self.ssh_keygen_overwrite_armed = false;
                 ctx.link().change_view(Some(ViewState::Edit));
             }
-            Msg::MainTabChanged => match self.current_tab().as_str() {
-                TAB_METRICS => {
-                    if let Some(id) = self
-                        .history_job_id
-                        .clone()
-                        .or_else(|| self.default_job_id())
-                    {
-                        let request_limit = self.requested_history_limit_for_job(&id);
-                        self.load_history_for_job_id(id, request_limit, true, ctx);
-                    }
+            Msg::MainTabChanged => {
+                if self.current_tab() != TAB_FAILOVER {
+                    self.guest_placement_timer = None;
                 }
-                TAB_FAILOVER => {
-                    if let Some(id) = self
-                        .failover_job_id
-                        .clone()
-                        .or_else(|| self.default_job_id())
-                    {
-                        self.load_failover_for_job_id(id, ctx);
+                match self.current_tab().as_str() {
+                    TAB_METRICS => {
+                        if let Some(id) = self
+                            .history_job_id
+                            .clone()
+                            .or_else(|| self.default_job_id())
+                        {
+                            let request_limit = self.requested_history_limit_for_job(&id);
+                            self.load_history_for_job_id(id, request_limit, true, ctx);
+                        }
                     }
+                    TAB_FAILOVER => {
+                        if let Some(id) = self
+                            .failover_job_id
+                            .clone()
+                            .or_else(|| self.default_job_id())
+                        {
+                            self.load_failover_for_job_id(id, ctx);
+                        }
+                    }
+                    TAB_JOBS => self.ensure_table_selection(),
+                    _ => {}
                 }
-                TAB_JOBS => self.ensure_table_selection(),
-                _ => {}
-            },
+            }
             Msg::Reload => {
                 ctx.link().change_view(None);
                 ctx.link().send_reload();
@@ -1900,7 +2293,6 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                                 .first()
                                 .map(|point| point.snapshot.clone())
                                 .unwrap_or_default();
-                            self.failback_precheck = None;
                         }
                         if let Some(current_key) = self.recovery_selection.selected_key() {
                             let current = current_key.to_string();
@@ -1923,13 +2315,21 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                 }
             }
             Msg::FailoverRecordsLoaded(id, result) => {
+                self.failover_records_loading = false;
                 if self.failover_job_id.as_deref() != Some(id.as_str()) {
+                    if self.current_tab() == TAB_FAILOVER {
+                        if let Some(current_id) = self.failover_job_id.clone() {
+                            self.refresh_guest_placement(current_id, ctx);
+                        }
+                    }
                     return false;
                 }
-                self.failover_records_loading = false;
                 match result {
                     Ok(mut records) => {
+                        let previous_live_state =
+                            failover_records_live_state(&self.failover_records);
                         records.sort_by(|a, b| b.failover_time.cmp(&a.failover_time));
+                        let previous_selection = self.failover_record_selection.selected_key();
                         let preferred = records
                             .iter()
                             .find(|record| {
@@ -1943,22 +2343,33 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                             })
                             .or_else(|| records.first())
                             .map(failover_record_key);
-                        if let Some(current_key) = self.failover_record_selection.selected_key() {
-                            if !records
+                        let next_selection = if let Some(current_key) = previous_selection.clone() {
+                            if records
                                 .iter()
                                 .any(|record| failover_record_key(record) == current_key)
                             {
-                                if let Some(preferred) = preferred.clone() {
-                                    self.failover_record_selection.select(preferred);
-                                }
+                                Some(current_key)
+                            } else {
+                                preferred.clone()
                             }
-                        } else if let Some(preferred) = preferred {
-                            self.failover_record_selection.select(preferred);
+                        } else {
+                            preferred.clone()
+                        };
+                        let selection_changed = previous_selection != next_selection;
+                        if let Some(next_selection) = next_selection {
+                            if selection_changed {
+                                self.failover_record_selection.select(next_selection);
+                            }
                         }
                         self.failover_record_store.set_data(records.clone());
                         self.failover_records = records;
-                        self.failback_precheck = None;
-                        self.failback_replace_source_guest = false;
+                        if selection_changed
+                            || previous_live_state
+                                != failover_records_live_state(&self.failover_records)
+                        {
+                            self.clear_failback_precheck();
+                        }
+                        self.rebuild_guest_placement();
                     }
                     Err(err) => {
                         ctx.link()
@@ -1966,12 +2377,70 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                     }
                 }
             }
+            Msg::GuestPlacementLoaded(id, result) => {
+                self.guest_placement_loading = false;
+                if self.failover_job_id.as_deref() != Some(id.as_str()) {
+                    if self.current_tab() == TAB_FAILOVER {
+                        if let Some(current_id) = self.failover_job_id.clone() {
+                            self.load_guest_placement(current_id, ctx);
+                        }
+                    }
+                    return false;
+                }
+                let previous = self.guest_placement_live_state();
+                self.guest_placement_resources = result.unwrap_or_default();
+                self.rebuild_guest_placement();
+                if previous != self.guest_placement_live_state() && !previous.is_empty() {
+                    self.clear_failback_precheck();
+                }
+                self.schedule_guest_placement_refresh(ctx);
+            }
+            Msg::GuestPlacementRefreshed(id, resources_result, records_result) => {
+                self.guest_placement_loading = false;
+                self.failover_records_loading = false;
+                if self.failover_job_id.as_deref() != Some(id.as_str()) {
+                    if self.current_tab() == TAB_FAILOVER {
+                        if let Some(current_id) = self.failover_job_id.clone() {
+                            self.refresh_guest_placement(current_id, ctx);
+                        }
+                    }
+                    return false;
+                }
+
+                let previous_rows = self.guest_placement_live_state();
+                let previous_records = failover_records_live_state(&self.failover_records);
+                self.guest_placement_resources = resources_result.unwrap_or_default();
+                if let Ok(mut records) = records_result {
+                    records.sort_by(|a, b| b.failover_time.cmp(&a.failover_time));
+                    self.failover_record_store.set_data(records.clone());
+                    self.failover_records = records;
+                }
+                self.rebuild_guest_placement();
+                if previous_records != failover_records_live_state(&self.failover_records)
+                    || (!previous_rows.is_empty()
+                        && previous_rows != self.guest_placement_live_state())
+                {
+                    self.clear_failback_precheck();
+                }
+                self.schedule_guest_placement_refresh(ctx);
+            }
+            Msg::GuestPlacementRefreshTick => {
+                self.guest_placement_timer = None;
+                if self.current_tab() == TAB_FAILOVER {
+                    if let Some(id) = self.failover_job_id.clone() {
+                        self.refresh_guest_placement(id, ctx);
+                    }
+                    self.schedule_guest_placement_refresh(ctx);
+                }
+            }
             Msg::RequestFailover(start_guest) => {
                 match self.failover_action_for_selection(start_guest) {
-                    Ok(action) => {
-                        ctx.link()
-                            .send_message(Msg::TriggerFailover(action.job_id, action.request));
-                    }
+                    Ok(_action) if self.source_guest_is_running() => ctx
+                        .link()
+                        .change_view(Some(ViewState::ConfirmFailover(start_guest))),
+                    Ok(action) => ctx
+                        .link()
+                        .send_message(Msg::TriggerFailover(action.job_id, action.request)),
                     Err(err) => {
                         ctx.link()
                             .show_error(tr!("Failover"), err.to_string(), true);
@@ -2041,12 +2510,6 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                     if !precheck.source_guest_exists {
                         self.failback_replace_source_guest = false;
                     }
-                    if self.failback_restore_mode == OffsiteFailbackRestoreMode::RestoreAsNew
-                        && self.failback_restore_vmid_input.trim().is_empty()
-                    {
-                        self.failback_restore_vmid_input =
-                            precheck.suggested_restore_vmid.to_string();
-                    }
                     self.failback_precheck = Some(precheck);
                 }
                 Err(err) => ctx
@@ -2055,18 +2518,9 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
             },
             Msg::RequestFailback(start_guest) => {
                 match self.failback_action_for_selection(start_guest) {
-                    Ok(action) => {
-                        if action.request.force
-                            || action.request.allow_full
-                            || action.request.cleanup_target
-                        {
-                            ctx.link()
-                                .change_view(Some(ViewState::ConfirmFailback(start_guest)));
-                        } else {
-                            ctx.link()
-                                .send_message(Msg::TriggerFailback(action.job_id, action.request));
-                        }
-                    }
+                    Ok(_action) => ctx
+                        .link()
+                        .change_view(Some(ViewState::ConfirmFailback(start_guest))),
                     Err(err) => ctx
                         .link()
                         .show_error(tr!("Failback"), err.to_string(), true),
@@ -2225,17 +2679,13 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
             Msg::UpdateFailoverVmid(value) => {
                 self.failover_vmid_input = value;
                 self.failover_form_dirty = true;
-                self.failback_precheck = None;
             }
             Msg::UpdateFailoverSnapshot(value) => {
                 self.failover_snapshot_input = value;
-                self.failback_precheck = None;
-                self.failback_replace_source_guest = false;
             }
             Msg::UpdateFailoverName(value) => {
                 self.failover_name_input = value;
                 self.failover_form_dirty = true;
-                self.failback_precheck = None;
             }
             Msg::UpdateFailoverStart(value) => {
                 self.failover_start_guest = value;
@@ -2244,28 +2694,13 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
             Msg::UpdateFailbackReplaceSource(value) => {
                 self.failback_replace_source_guest = value;
             }
-            Msg::UpdateFailbackRestoreMode(value) => {
-                self.failback_restore_mode = if value == "restore-as-new" {
-                    OffsiteFailbackRestoreMode::RestoreAsNew
-                } else {
-                    OffsiteFailbackRestoreMode::ReplaceOriginal
-                };
-                if let Some(job) = self.selected_failover_job() {
-                    self.failback_restore_vmid_input = match self.failback_restore_mode {
-                        OffsiteFailbackRestoreMode::ReplaceOriginal => job.job.vmid.to_string(),
-                        OffsiteFailbackRestoreMode::RestoreAsNew => {
-                            job.job.vmid.saturating_add(1_000).to_string()
-                        }
-                    };
-                }
-                self.failback_replace_source_guest = false;
-                self.failback_allow_full = false;
-                self.failback_precheck = None;
-            }
             Msg::UpdateFailbackRestoreVmid(value) => {
-                self.failback_restore_vmid_input = value;
-                self.failback_replace_source_guest = false;
-                self.failback_precheck = None;
+                if let Some(job) = self.selected_failover_job() {
+                    self.failback_restore_vmid_input = job.job.vmid.to_string();
+                } else if !value.trim().is_empty() {
+                    self.failback_restore_vmid_input = value;
+                }
+                self.clear_failback_precheck();
             }
             Msg::UpdateFailbackAllowFull(value) => {
                 self.failback_allow_full = value;
@@ -2273,9 +2708,11 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
             Msg::UpdateFailbackCleanupTarget(value) => {
                 self.failback_cleanup_target = value;
             }
+            Msg::UpdateFailbackStart(value) => {
+                self.failback_start_guest = value;
+            }
             Msg::FailbackRecordSelected => {
-                self.failback_precheck = None;
-                self.failback_replace_source_guest = false;
+                self.clear_failback_precheck();
             }
             Msg::ToggleFailoverAdvanced => {
                 self.failover_advanced_expanded = !self.failover_advanced_expanded;
@@ -2283,7 +2720,6 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
             Msg::ResetFailoverDefaults => {
                 if let Some(job) = self.selected_failover_job() {
                     self.set_failover_defaults_for_job(&job);
-                    self.failback_precheck = None;
                 }
             }
             Msg::JobsFilterChanged(value) => {
@@ -2976,28 +3412,20 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                 .as_ref()
                 .map(|precheck| precheck.source_guest_exists)
                 .unwrap_or(false);
-            let failback_full_required = self
+            let failback_full_authorization_required = self
                 .failback_precheck
                 .as_ref()
-                .map(|precheck| precheck.full_required)
+                .map(|precheck| precheck.full_required || precheck.repair_requires_full_reseed)
                 .unwrap_or(false);
             let failback_execution_ready = self
                 .failback_precheck
                 .as_ref()
                 .map(|precheck| {
-                    (precheck.incremental || self.failback_allow_full)
-                        && (!precheck.source_guest_exists
-                            || (self.failback_restore_mode
-                                == OffsiteFailbackRestoreMode::ReplaceOriginal
-                                && self.failback_replace_source_guest))
+                    (!precheck.full_required || self.failback_allow_full)
+                        && (!precheck.repair_requires_full_reseed || self.failback_allow_full)
+                        && (!precheck.source_guest_exists || self.failback_replace_source_guest)
                 })
                 .unwrap_or(false);
-            let failback_restore_mode_items: Rc<Vec<yew::AttrValue>> =
-                Rc::new(vec!["replace-original".into(), "restore-as-new".into()]);
-            let failback_restore_mode_value = match self.failback_restore_mode {
-                OffsiteFailbackRestoreMode::ReplaceOriginal => "replace-original",
-                OffsiteFailbackRestoreMode::RestoreAsNew => "restore-as-new",
-            };
             let selected_failover_record = self.selected_failover_record();
             let selected_record_active = selected_failover_record
                 .as_ref()
@@ -3007,6 +3435,76 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                 .selected_failover_job()
                 .map(|job| job.status.suspended)
                 .unwrap_or(false);
+            let selected_job = self.selected_failover_job();
+            let active_records = self
+                .failover_records
+                .iter()
+                .filter(|record| record.lifecycle == OffsiteFailoverLifecycle::Active)
+                .collect::<Vec<_>>();
+            let has_active_promotion = !active_records.is_empty();
+            let source_and_target_running =
+                self.source_guest_is_running() && self.promoted_guest_is_running();
+            let source_guest_missing = self.source_guest_is_missing();
+            let active_guest_missing = active_records
+                .iter()
+                .any(|record| record.target_guest_state == OffsiteGuestState::Missing);
+            let latest_returned_record = self
+                .failover_records
+                .first()
+                .filter(|record| record.lifecycle == OffsiteFailoverLifecycle::Returned);
+            let attention_required = source_and_target_running
+                || (source_guest_missing && !has_active_promotion)
+                || active_guest_missing
+                || active_records.len() > 1;
+            let (workflow_stage, workflow_icon, workflow_class, next_action) = if attention_required
+            {
+                (
+                    tr!("Attention Required"),
+                    "exclamation-triangle",
+                    ColorScheme::Warning,
+                    if source_and_target_running {
+                        tr!("Source and promoted guests are both running. Isolate one side immediately, then refresh live state before continuing.")
+                    } else if source_guest_missing && !has_active_promotion {
+                        tr!("The source guest is not registered. If the source outage is confirmed, select a recovery point and promote the replica on the target.")
+                    } else if active_records.len() > 1 {
+                        tr!("Multiple active promotion records need review. Select the intended promoted guest before failback.")
+                    } else {
+                        tr!("The promoted guest is missing. Review the reconciled record and archive it only if it was intentionally removed.")
+                    },
+                )
+            } else if has_active_promotion && failback_execution_ready {
+                (
+                    tr!("Ready for Failback"),
+                    "check-circle",
+                    ColorScheme::Success,
+                    tr!("The failback precheck passed. Review the options and return the workload to its original source VMID."),
+                )
+            } else if has_active_promotion {
+                (
+                    tr!("Promoted on Target"),
+                    "bolt",
+                    ColorScheme::Primary,
+                    tr!("The promoted workload is authoritative. Run the failback precheck when you are ready to return it to source."),
+                )
+            } else if let Some(returned) = latest_returned_record {
+                (
+                    tr!("Returned to Source"),
+                    "home",
+                    ColorScheme::Success,
+                    if returned.target_cleaned {
+                        tr!("The workload has returned to source and target guest cleanup completed. Confirm incremental protection resumes.")
+                    } else {
+                        tr!("The workload has returned to source, but the promoted target guest was retained. Confirm it remains stopped and finish cleanup before resuming protection.")
+                    },
+                )
+            } else {
+                (
+                    tr!("Protected on Source"),
+                    "shield",
+                    ColorScheme::Success,
+                    tr!("Select a recoverable point and promote it if the source workload must be recovered on the target."),
+                )
+            };
             let selected_record_text = selected_failover_record
                 .as_ref()
                 .map(|record| {
@@ -3035,7 +3533,10 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                 }
             };
             let failback_precheck_status = self.failback_precheck.as_ref().map(|precheck| {
-                let icon = if precheck.source_guest_exists || precheck.full_required {
+                let icon = if precheck.source_guest_exists
+                    || precheck.full_required
+                    || precheck.repair_requires_full_reseed
+                {
                     "fa fa-exclamation-triangle warning"
                 } else if precheck.incremental {
                     "fa fa-check good"
@@ -3044,12 +3545,39 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                 };
                 let summary = if precheck.full_required {
                     tr!("A full failback transfer is required.")
+                } else if precheck.repair_requires_full_reseed {
+                    tr!("Protection repair needs full reseed authorization.")
                 } else if precheck.source_guest_exists {
                     tr!("Original source guest needs an explicit replacement decision.")
                 } else if precheck.incremental {
                     tr!("Incremental failback is available.")
                 } else {
                     tr!("Incremental failback is not available.")
+                };
+                let repair_snapshot = precheck
+                    .repair_snapshot
+                    .as_deref()
+                    .map(snapshot_tail)
+                    .unwrap_or_else(|| tr!("None"));
+                let repair_target_summary = if precheck.repair_target_snapshots.is_empty() {
+                    tr!("0")
+                } else {
+                    let names = precheck
+                        .repair_target_snapshots
+                        .iter()
+                        .take(3)
+                        .map(|snapshot| snapshot_tail(snapshot))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    if precheck.repair_target_snapshots.len() > 3 {
+                        format!(
+                            "{} ({names}, +{})",
+                            precheck.repair_target_snapshots.len(),
+                            precheck.repair_target_snapshots.len() - 3
+                        )
+                    } else {
+                        format!("{} ({names})", precheck.repair_target_snapshots.len())
+                    }
                 };
                 html! {
                     <div style="margin-top:8px;">
@@ -3066,6 +3594,33 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                                 </div>
                             }).unwrap_or_default()
                         }
+                        <div style="opacity:0.8; margin-top:4px;">
+                            {format!(
+                                "{}: {}",
+                                tr!("Repair mode"),
+                                failback_repair_mode_text(precheck.repair_mode),
+                            )}
+                        </div>
+                        <div style="opacity:0.8; margin-top:4px;">
+                            {format!("{}: {repair_snapshot}", tr!("Repair snapshot"))}
+                        </div>
+                        <div style="opacity:0.8; margin-top:4px;">
+                            {format!(
+                                "{}: {repair_target_summary}",
+                                tr!("Repair target snapshots"),
+                            )}
+                        </div>
+                        <div style="opacity:0.8; margin-top:4px;">
+                            {format!(
+                                "{}: {}",
+                                tr!("Repair requires full reseed"),
+                                if precheck.repair_requires_full_reseed {
+                                    tr!("Yes")
+                                } else {
+                                    tr!("No")
+                                },
+                            )}
+                        </div>
                     </div>
                 }
             });
@@ -3086,7 +3641,12 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                         )
                         .with_flex_spacer()
                         .with_child(
-                            Button::refresh(self.recovery_points_loading || self.failover_running)
+                            Button::refresh(
+                                self.recovery_points_loading
+                                    || self.failover_records_loading
+                                    || self.guest_placement_loading
+                                    || self.failover_running,
+                            )
                                 .on_activate({
                                     let id = id.clone();
                                     let link = ctx.link().clone();
@@ -3136,7 +3696,12 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                         .with_child(
                             Button::new(tr!("Promote"))
                                 .icon_class("fa fa-bolt")
-                                .disabled(!failover_ready_ok || self.failover_running)
+                                .disabled(
+                                    !failover_ready_ok
+                                        || self.failover_running
+                                        || self.guest_placement_loading
+                                        || has_active_promotion,
+                                )
                                 .on_activate({
                                     let link = ctx.link().clone();
                                     let start_guest = self.failover_start_guest;
@@ -3146,7 +3711,12 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                         .with_child(
                             Button::new(tr!("Promote + Start"))
                                 .icon_class("fa fa-play-circle")
-                                .disabled(!failover_ready_ok || self.failover_running)
+                                .disabled(
+                                    !failover_ready_ok
+                                        || self.failover_running
+                                        || self.guest_placement_loading
+                                        || has_active_promotion,
+                                )
                                 .on_activate({
                                     let link = ctx.link().clone();
                                     move |_| link.send_message(Msg::RequestFailover(true))
@@ -3218,7 +3788,11 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                         })
                         .with_flex_spacer()
                         .with_child(
-                            Button::refresh(self.failover_records_loading || self.failback_running)
+                            Button::refresh(
+                                self.failover_records_loading
+                                    || self.guest_placement_loading
+                                    || self.failback_running,
+                            )
                                 .on_activate({
                                     let id = id.clone();
                                     let link = ctx.link().clone();
@@ -3230,7 +3804,7 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                 )
                 .with_child(html! {
                     <div style="padding: 0 12px 8px; opacity: 0.82;">
-                        {tr!("Select a promoted guest, choose how to restore it on the source, then run a readiness check. The promoted disk state is snapshotted automatically when failback starts.")}
+                        {tr!("Failback always returns the promoted guest to the original source VMID for this job. Use Promote / Restore if you need an alternate recovery VMID instead.")}
                         {
                             selected_failover_record.as_ref().map(|record| html! {
                                 <div style="margin-top:6px;">
@@ -3254,17 +3828,10 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                     InputPanel::new()
                         .padding(3)
                         .with_field(
-                            tr!("Restore Mode"),
-                            Combobox::new()
-                                .editable(false)
-                                .value(failback_restore_mode_value)
-                                .items(failback_restore_mode_items)
-                                .on_change(ctx.link().callback(Msg::UpdateFailbackRestoreMode)),
-                        )
-                        .with_field(
-                            tr!("Source Restore VMID"),
+                            tr!("Original Source VMID"),
                             Field::new()
                                 .value(self.failback_restore_vmid_input.clone())
+                                .disabled(true)
                                 .on_change(ctx.link().callback(Msg::UpdateFailbackRestoreVmid)),
                         )
                         .with_large_field(
@@ -3275,31 +3842,36 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                                 .on_change(ctx.link().callback(Msg::UpdateFailbackCleanupTarget)),
                         ),
                 )
-                .with_optional_child(
-                    (failback_source_conflict
-                        && self.failback_restore_mode == OffsiteFailbackRestoreMode::ReplaceOriginal)
-                        .then(|| {
-                            InputPanel::new().padding(3).with_large_field(
-                                tr!("Source Guest Conflict"),
-                                Checkbox::new()
-                                    .box_label(format!(
-                                        "{} {} {}",
-                                        tr!("Replace existing original source guest"),
-                                        self.failback_restore_vmid_input,
-                                        tr!("after the precheck succeeds (destructive)."),
-                                    ))
-                                    .checked(self.failback_replace_source_guest)
-                                    .on_change(
-                                        ctx.link().callback(Msg::UpdateFailbackReplaceSource),
-                                    ),
-                            )
-                        }),
-                )
-                .with_optional_child(failback_full_required.then(|| {
+                .with_child(
                     InputPanel::new().padding(3).with_large_field(
-                        tr!("Full Transfer"),
+                        tr!("Start Guest"),
                         Checkbox::new()
-                            .box_label(tr!("Proceed with a full ZFS transfer when incremental lineage is unavailable."))
+                            .box_label(tr!("Start the restored source guest after failback"))
+                            .checked(self.failback_start_guest)
+                            .on_change(ctx.link().callback(Msg::UpdateFailbackStart)),
+                    ),
+                )
+                .with_optional_child(
+                    failback_source_conflict.then(|| {
+                        InputPanel::new().padding(3).with_large_field(
+                            tr!("Replacement Consent"),
+                            Checkbox::new()
+                                .box_label(format!(
+                                    "{} {} {}",
+                                    tr!("Replace existing original source guest"),
+                                    self.failback_restore_vmid_input,
+                                    tr!("after the precheck succeeds (destructive)."),
+                                ))
+                                .checked(self.failback_replace_source_guest)
+                                .on_change(ctx.link().callback(Msg::UpdateFailbackReplaceSource)),
+                        )
+                    }),
+                )
+                .with_optional_child(failback_full_authorization_required.then(|| {
+                    InputPanel::new().padding(3).with_large_field(
+                        tr!("Full Authorization"),
+                        Checkbox::new()
+                            .box_label(tr!("Authorize any required full failback transfer or destructive reseed of job-owned target replica datasets."))
                             .checked(self.failback_allow_full)
                             .on_change(ctx.link().callback(Msg::UpdateFailbackAllowFull)),
                     )
@@ -3312,6 +3884,8 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                                 .disabled(
                                     !failback_ready_ok
                                         || self.failover_running
+                                        || self.failover_records_loading
+                                        || self.guest_placement_loading
                                         || self.failback_running,
                                 )
                                 .on_activate(ctx.link().callback(|_| Msg::FailbackPrecheck)),
@@ -3322,12 +3896,14 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                                 .disabled(
                                     !failback_ready_ok
                                         || self.failover_running
+                                        || self.failover_records_loading
+                                        || self.guest_placement_loading
                                         || self.failback_running
                                         || !failback_execution_ready,
                                 )
                                 .on_activate({
                                     let link = ctx.link().clone();
-                                    let start_guest = self.failover_start_guest;
+                                    let start_guest = self.failback_start_guest;
                                     move |_| link.send_message(Msg::RequestFailback(start_guest))
                                 }),
                         )
@@ -3337,6 +3913,8 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                                 .disabled(
                                     !failback_ready_ok
                                         || self.failover_running
+                                        || self.failover_records_loading
+                                        || self.guest_placement_loading
                                         || self.failback_running
                                         || !failback_execution_ready,
                                 )
@@ -3359,16 +3937,55 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                     </div>
                 })
                 .into();
-            let snapshot_states_panel: Html = Panel::new()
+            let selected_protection_point = self
+                .recovery_points
+                .iter()
+                .find(|point| point.snapshot == self.failover_snapshot_input);
+            let protection_panel: Html = Panel::new()
                 .border(true)
                 .style("height", "100%")
-                .title(tr!("Recovery Snapshot States"))
+                .title(tr!("Protection State"))
                 .with_child(html! {
-                    <div style="padding: 0 12px 4px; opacity: 0.8;">
-                        {tr!("Transfer mode does not block recovery; any listed recoverable snapshot can be promoted.")}
+                    <div style="padding: 0 12px 12px; display:grid; gap:7px;">
+                        <div>
+                            <b>{tr!("Target")}{": "}</b>
+                            {selected_job.as_ref().map(|job| format!(
+                                "{} / {} / {}",
+                                job.job.target_remote, job.job.target_node, job.job.target_dataset,
+                            )).unwrap_or_else(|| tr!("Unknown"))}
+                        </div>
+                        <div>
+                            <b>{tr!("Recoverable Points")}{": "}</b>
+                            {self.recovery_points.len()}
+                        </div>
+                        <div>
+                            <b>{tr!("Selected Recovery Point")}{": "}</b>
+                            {selected_protection_point.map(|point| format!(
+                                "{} ({})",
+                                snapshot_tail(&point.snapshot),
+                                render_epoch_short(point.end_time),
+                            )).unwrap_or_else(|| tr!("None"))}
+                        </div>
+                        <div>
+                            <b>{tr!("Latest Replication State")}{": "}</b>
+                            {selected_job.as_ref().map(status_text).unwrap_or_else(|| tr!("Unknown"))}
+                        </div>
+                        <div>
+                            <b>{tr!("Job State")}{": "}</b>
+                            {if selected_job_suspended { tr!("Suspended") } else { tr!("Active") }}
+                        </div>
+                        {if !has_active_promotion && !self.recovery_points.is_empty() {
+                            html! {
+                                <div style="margin-top:4px; display:flex; align-items:center; gap:6px;">
+                                    {Fa::new("info-circle")}
+                                    <b>{tr!("Replica available; no promoted guest registered.")}</b>
+                                </div>
+                            }
+                        } else {
+                            html! {}
+                        }}
                     </div>
                 })
-                .with_child(render_recovery_snapshot_state_tiles(&self.recovery_points))
                 .into();
             let recovery_snapshots_panel_height = if self.recovery_filters_expanded {
                 "440px"
@@ -3385,11 +4002,66 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                         .class(pwt::css::FlexFit)
                         .gap(3)
                         .with_child(
+                            Panel::new()
+                                .border(true)
+                                .title(tr!("Recovery Workflow"))
+                                .with_child(html! {
+                                    <div style="padding:0 12px 12px; display:flex; gap:10px; align-items:flex-start;">
+                                        {Fa::new(workflow_icon).class(workflow_class)}
+                                        <div>
+                                            <div style="font-weight:600; font-size:1.08em;">{workflow_stage}</div>
+                                            <div style="margin-top:3px; opacity:0.86;">{next_action}</div>
+                                        </div>
+                                    </div>
+                                })
+                                .with_optional_child(source_and_target_running.then(|| html! {
+                                    <div class="pwt-color-warning" style="padding:0 12px 12px; font-weight:600;">
+                                        {tr!("Split-brain warning: source and promoted guests are both reported as running.")}
+                                    </div>
+                                })),
+                        )
+                        .with_child(
+                            Panel::new()
+                                .border(true)
+                                .title(tr!("Current Guest Placement"))
+                                .style("height", if active_records.len() > 1 { "250px" } else { "190px" })
+                                .with_child(
+                                    Toolbar::new()
+                                        .border_bottom(true)
+                                        .with_child(html! {
+                                            <span style="opacity:0.78;">
+                                                {tr!("Live guest registration and power state; recovery actions remain in the guided workflow below.")}
+                                            </span>
+                                        })
+                                        .with_flex_spacer()
+                                        .with_child(
+                                            Button::refresh(
+                                                self.guest_placement_loading
+                                                    || self.failover_records_loading,
+                                            )
+                                                .on_activate({
+                                                    let id = id.clone();
+                                                    let link = ctx.link().clone();
+                                                    move |_| link.send_message(Msg::GuestPlacementRefreshTick)
+                                                }),
+                                        ),
+                                )
+                                .with_child(
+                                    DataTable::new(
+                                        self.guest_placement_columns.clone(),
+                                        self.guest_placement_store.clone(),
+                                    )
+                                    .striped(true)
+                                    .hover(true)
+                                    .class(pwt::css::FlexFit),
+                                ),
+                        )
+                        .with_child(
                             html! {
                                 <div style="display:grid; gap:12px; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); align-items:stretch;">
-                                    {recovery_panel}
-                                    {snapshot_states_panel}
-                                    {failback_panel}
+                                    {if has_active_promotion { failback_panel.clone() } else { recovery_panel.clone() }}
+                                    {protection_panel}
+                                    {if has_active_promotion { recovery_panel } else { failback_panel }}
                                 </div>
                             },
                         )
@@ -3740,6 +4412,28 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                 JobPickerTarget::RunNow,
                 ctx,
             )),
+            ViewState::ConfirmFailover(start_guest) => self
+                .failover_action_for_selection(*start_guest)
+                .ok()
+                .map(|action| {
+                    let action_for_confirm = action.clone();
+                    let mut dialog = ConfirmDialog::default().dangerous(true).on_confirm({
+                        let link = ctx.link().clone();
+                        move |_| {
+                            link.send_message(Msg::TriggerFailover(
+                                action_for_confirm.job_id.clone(),
+                                action_for_confirm.request.clone(),
+                            ))
+                        }
+                    });
+                    dialog.set_confirm_message(format!(
+                        "{}\n{}\n{}",
+                        tr!("The original source guest is currently reported as running."),
+                        tr!("Promoting while the source is active can cause split-brain and data corruption. Its reported state may be stale during a genuine outage."),
+                        tr!("Confirm that you have isolated the source before continuing."),
+                    ));
+                    dialog.into()
+                }),
             ViewState::ConfirmFailback(start_guest) => self
                 .failback_action_for_selection(*start_guest)
                 .ok()
@@ -3755,19 +4449,63 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                         }
                     });
                     let mut details = Vec::new();
-                    if action.request.restore_mode == OffsiteFailbackRestoreMode::ReplaceOriginal {
-                        details.push(tr!(
-                            "Returned disks are received and validated in staging before the existing source guest is replaced."
-                        ));
-                    } else {
-                        details.push(format!(
-                            "{} {}.",
-                            tr!("A new source-side guest will be registered with VMID"),
-                            action.request.restore_vmid,
-                        ));
+                    details.push(tr!(
+                        "Returned disks are received and validated in staging before the original source guest is replaced."
+                    ));
+                    details.push(format!(
+                        "{} {}.",
+                        tr!("Failback will restore the job back onto source VMID"),
+                        action.request.restore_vmid,
+                    ));
+                    if let Some(precheck) = self.failback_precheck.as_ref() {
+                        if !precheck.repair_target_snapshots.is_empty() {
+                            let names = precheck
+                                .repair_target_snapshots
+                                .iter()
+                                .map(|snapshot| snapshot_tail(snapshot))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            if precheck.repair_mode == OffsiteFailbackRepairMode::RollbackTail {
+                                details.push(format!(
+                                    "{} {}: {}.",
+                                    tr!("Protection repair will delete"),
+                                    tr!(
+                                        "{count} rollback-tail target snapshot(s)",
+                                        count = precheck.repair_target_snapshots.len(),
+                                    ),
+                                    names,
+                                ));
+                            } else if precheck.repair_requires_full_reseed {
+                                details.push(format!(
+                                    "{} {}: {}.",
+                                    tr!("The current target snapshot tail contains"),
+                                    tr!(
+                                        "{count} snapshot(s)",
+                                        count = precheck.repair_target_snapshots.len(),
+                                    ),
+                                    names,
+                                ));
+                            }
+                        }
                     }
                     if action.request.allow_full {
-                        details.push(tr!("A full ZFS transfer will be sent because incremental lineage is unavailable."));
+                        if self
+                            .failback_precheck
+                            .as_ref()
+                            .is_some_and(|precheck| precheck.full_required)
+                        {
+                            details.push(tr!("A full ZFS transfer will be sent because incremental lineage is unavailable."));
+                        }
+                        if self
+                            .failback_precheck
+                            .as_ref()
+                            .is_some_and(|precheck| precheck.repair_requires_full_reseed)
+                        {
+                            details.push(tr!("Full authorization may destroy and reseed the job-owned target replica datasets if that is the only safe way to re-arm protection."));
+                        }
+                        if self.failback_precheck.as_ref().is_none() {
+                            details.push(tr!("Full authorization may send a full ZFS transfer and may destroy/reseed job-owned target replica datasets if protection must be re-armed with a full reseed."));
+                        }
                     }
                     if action.request.cleanup_target {
                         details.push(tr!("The stopped promoted target guest will be removed after source registration succeeds."));
@@ -4487,6 +5225,29 @@ fn guest_type_text(guest_type: GuestType) -> &'static str {
     }
 }
 
+fn resource_guest_vmid(resource: &Resource) -> Option<u32> {
+    match resource {
+        Resource::PveQemu(resource) => Some(resource.vmid),
+        Resource::PveLxc(resource) => Some(resource.vmid),
+        _ => None,
+    }
+}
+
+fn resource_guest_node(resource: &Resource) -> Option<String> {
+    match resource {
+        Resource::PveQemu(resource) => Some(resource.node.clone()),
+        Resource::PveLxc(resource) => Some(resource.node.clone()),
+        _ => None,
+    }
+}
+
+fn resource_matches_guest_type(resource: &Resource, guest_type: GuestType) -> bool {
+    matches!(
+        (resource, guest_type),
+        (Resource::PveQemu(_), GuestType::Qemu) | (Resource::PveLxc(_), GuestType::Lxc)
+    )
+}
+
 fn status_text(item: &OffsiteReplicationJobStatus) -> String {
     if item.status.running {
         return tr!("Running");
@@ -5039,53 +5800,6 @@ fn render_run_mode_summary_panel(runs: &[OffsiteReplicationRun]) -> Html {
         .into()
 }
 
-fn render_recovery_snapshot_state_tiles(points: &[OffsiteRecoveryPoint]) -> Html {
-    let full = points
-        .iter()
-        .filter(|point| point.transfer_mode.as_deref() == Some("full"))
-        .count();
-    let incremental = points
-        .iter()
-        .filter(|point| point.transfer_mode.as_deref() == Some("incremental"))
-        .count();
-    let unknown = points
-        .iter()
-        .filter(|point| {
-            !matches!(
-                point.transfer_mode.as_deref(),
-                Some("full") | Some("incremental")
-            )
-        })
-        .count();
-    let all = points.len();
-
-    let tiles = vec![
-        summary_list_tile(
-            "check",
-            Some("pwt-color-success"),
-            tr!("Recoverable Points"),
-            all,
-        ),
-        summary_list_tile("clone", None, tr!("Full Transfers"), full),
-        summary_list_tile(
-            "exchange",
-            Some("pwt-color-warning"),
-            tr!("Incremental Transfers"),
-            incremental,
-        ),
-        summary_list_tile("question-circle", None, tr!("Unknown Mode"), unknown),
-        summary_list_tile("th", None, tr!("Total Points"), all),
-    ];
-
-    List::new(tiles.len() as u64, move |idx: u64| {
-        tiles[idx as usize].clone()
-    })
-    .padding(2)
-    .class(pwt::css::Flex::Fill)
-    .grid_template_columns("auto auto 1fr auto")
-    .into()
-}
-
 fn snapshot_tail(snapshot: &str) -> String {
     snapshot.rsplit('@').next().unwrap_or(snapshot).to_string()
 }
@@ -5114,6 +5828,14 @@ fn failback_lineage_text(state: OffsiteFailbackLineage) -> String {
         OffsiteFailbackLineage::Incremental => tr!("Incremental"),
         OffsiteFailbackLineage::FullRequired => tr!("Full required"),
         OffsiteFailbackLineage::Diverged => tr!("Diverged"),
+    }
+}
+
+fn failback_repair_mode_text(mode: OffsiteFailbackRepairMode) -> String {
+    match mode {
+        OffsiteFailbackRepairMode::IncrementalResume => tr!("Incremental resume"),
+        OffsiteFailbackRepairMode::RollbackTail => tr!("Rollback target tail"),
+        OffsiteFailbackRepairMode::FullReseed => tr!("Full reseed"),
     }
 }
 

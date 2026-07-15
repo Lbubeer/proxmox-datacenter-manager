@@ -622,7 +622,7 @@ fn resume_replication(id: String, rpcenv: &mut dyn RpcEnvironment) -> Result<(),
 #[api(
     protected: true,
     input: {
-        description: "Check whether failback can use an incremental ZFS stream.",
+        description: "Check failback transfer lineage and the post-failback protection repair mode.",
         properties: {
             id: { schema: OFFSITE_REPLICATION_ID_SCHEMA },
             request: {
@@ -636,7 +636,7 @@ fn resume_replication(id: String, rpcenv: &mut dyn RpcEnvironment) -> Result<(),
     },
     returns: { type: OffsiteFailbackPrecheck },
 )]
-/// Check failback lineage and safety before starting a failback worker.
+/// Check failback lineage, repair classification, and safety before starting a failback worker.
 fn failback_precheck(
     id: String,
     request: OffsiteFailbackRequest,

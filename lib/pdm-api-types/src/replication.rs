@@ -2,7 +2,9 @@ use serde::{Deserialize, Serialize};
 
 use anyhow::{bail, Error};
 
-use proxmox_schema::{api, const_regex, ApiStringFormat, IntegerSchema, Schema, StringSchema};
+use proxmox_schema::{
+    api, const_regex, ApiStringFormat, ArraySchema, IntegerSchema, Schema, StringSchema,
+};
 
 use crate::resource::GuestType;
 use crate::PROXMOX_SAFE_ID_FORMAT;
@@ -475,7 +477,11 @@ pub enum OffsiteFailoverLifecycle {
     #[serde(rename = "active")]
     Active,
     /// Promotion was returned successfully to the source.
-    #[serde(rename = "returned")]
+    #[serde(
+        rename = "returned",
+        alias = "pending-repair",
+        alias = "manual-reconfigure"
+    )]
     Returned,
     /// Operator archived a promotion that will no longer be returned.
     #[serde(rename = "abandoned")]
@@ -521,6 +527,22 @@ pub enum OffsiteFailbackLineage {
     /// Expected promoted disks are missing or no longer match the record.
     #[serde(rename = "diverged")]
     Diverged,
+}
+
+#[api]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+/// Post-failback protection repair mode required before replication can resume.
+pub enum OffsiteFailbackRepairMode {
+    /// Source and target can resume incremental replication immediately.
+    #[default]
+    #[serde(rename = "incremental-resume")]
+    IncrementalResume,
+    /// The target has a newer job-owned snapshot tail that must be rolled back first.
+    #[serde(rename = "rollback-tail")]
+    RollbackTail,
+    /// Incremental repair is not possible; the target must be reseeded from the source.
+    #[serde(rename = "full-reseed")]
+    FullReseed,
 }
 
 #[api]
@@ -585,19 +607,6 @@ pub struct OffsiteFailoverRecord {
     pub status_message: Option<String>,
 }
 
-#[api]
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-/// Destination policy used when returning a promoted guest to its source remote.
-pub enum OffsiteFailbackRestoreMode {
-    /// Replace the original source guest using its original VMID.
-    #[default]
-    #[serde(rename = "replace-original")]
-    ReplaceOriginal,
-    /// Register the returned guest under a new VMID on the original source node.
-    #[serde(rename = "restore-as-new")]
-    RestoreAsNew,
-}
-
 #[api(
     properties: {
         "restore-vmid": {
@@ -605,7 +614,6 @@ pub enum OffsiteFailbackRestoreMode {
             minimum: 1,
             maximum: 999_999_999,
         },
-        "restore-mode": { type: OffsiteFailbackRestoreMode },
         "recovered-name": {
             schema: OFFSITE_REPLICATION_RECOVERED_NAME_SCHEMA,
             optional: true,
@@ -634,18 +642,15 @@ pub enum OffsiteFailbackRestoreMode {
 pub struct OffsiteFailbackRequest {
     /// VMID of the promoted recovery guest on the target node.
     pub recovery_vmid: u32,
-    /// VMID to create on the original source node.
+    /// VMID to replace on the original source node. This must match the job source VMID.
     pub restore_vmid: u32,
-    /// Whether the original guest is replaced or a new source-side guest is created.
-    #[serde(default)]
-    pub restore_mode: OffsiteFailbackRestoreMode,
     /// Optional guest name override on the original source node.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovered_name: Option<String>,
     /// Start the guest after registration on the original source node.
     #[serde(default)]
     pub start_guest: bool,
-    /// Allow a full send when the common base snapshot is missing.
+    /// Allow a full send or post-failback full reseed when incremental repair is not possible.
     #[serde(default)]
     pub allow_full: bool,
     /// Confirm destructive replacement of an existing guest on the original source node.
@@ -656,7 +661,19 @@ pub struct OffsiteFailbackRequest {
     pub cleanup_target: bool,
 }
 
-#[api]
+pub const OFFSITE_FAILBACK_REPAIR_TARGET_SNAPSHOTS_SCHEMA: Schema = ArraySchema::new(
+    "Target-side snapshots removed by rollback-tail repair.",
+    &StringSchema::new("Target-side snapshot removed by rollback-tail repair.").schema(),
+)
+.schema();
+
+#[api(
+    properties: {
+        "repair-target-snapshots": {
+            schema: OFFSITE_FAILBACK_REPAIR_TARGET_SNAPSHOTS_SCHEMA,
+        },
+    },
+)]
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 /// Result of failback safety and lineage checks.
@@ -668,14 +685,27 @@ pub struct OffsiteFailbackPrecheck {
     pub common_snapshot: Option<String>,
     /// Whether a full send would be required.
     pub full_required: bool,
+    /// Post-failback protection repair mode required before replication can resume.
+    #[serde(default)]
+    pub repair_mode: OffsiteFailbackRepairMode,
+    /// Latest common source/target snapshot used for protection repair, if found.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repair_snapshot: Option<String>,
+    /// GUID of the latest common protection-repair snapshot, if found.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repair_snapshot_guid: Option<String>,
+    /// Target-side divergent snapshots that would be removed during rollback-tail repair.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repair_target_snapshots: Vec<String>,
+    /// Whether protection repair would require an explicit full reseed of the target.
+    #[serde(default)]
+    pub repair_requires_full_reseed: bool,
     /// Whether the original source VMID is currently registered on the source node.
     pub source_guest_exists: bool,
     /// Whether the original source guest is currently running.
     pub source_guest_running: bool,
     /// Whether the selected promoted recovery guest is currently running.
     pub recovery_guest_running: bool,
-    /// VMID recommended when restoring as a separate source-side guest.
-    pub suggested_restore_vmid: u32,
     /// Human-readable status message.
     pub message: String,
 }
@@ -819,4 +849,44 @@ pub struct OffsiteReplicationConfig {
     /// Job list.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub jobs: Vec<OffsiteReplicationJob>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use proxmox_schema::ApiType;
+
+    #[test]
+    fn failback_precheck_schema_keeps_explicit_repair_snapshot_array() {
+        let object = OffsiteFailbackPrecheck::API_SCHEMA
+            .any_object()
+            .expect("precheck has an object schema");
+        let (_, property) = object
+            .lookup("repair-target-snapshots")
+            .expect("repair snapshot property exists");
+        let Schema::Array(array) = property else {
+            panic!("repair snapshot property must be an array");
+        };
+        let Schema::String(item) = array.items else {
+            panic!("repair snapshot entries must be strings");
+        };
+
+        assert_eq!(
+            item.description,
+            "Target-side snapshot removed by rollback-tail repair."
+        );
+    }
+
+    #[test]
+    fn returned_lifecycle_accepts_legacy_lab_aliases() {
+        let pending_repair: OffsiteFailoverLifecycle =
+            serde_json::from_str("\"pending-repair\"").expect("legacy pending-repair parses");
+        let manual_reconfigure: OffsiteFailoverLifecycle =
+            serde_json::from_str("\"manual-reconfigure\"")
+                .expect("legacy manual-reconfigure parses");
+
+        assert_eq!(pending_repair, OffsiteFailoverLifecycle::Returned);
+        assert_eq!(manual_reconfigure, OffsiteFailoverLifecycle::Returned);
+    }
 }

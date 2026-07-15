@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use pdm_api_types::{
     verify_offsite_recovered_name, verify_offsite_snapshot, verify_offsite_ssh_key_path,
     verify_offsite_ssh_user, verify_offsite_target_dataset, Authid, OffsiteFailbackLineage,
-    OffsiteFailbackPrecheck, OffsiteFailbackRequest, OffsiteFailbackRestoreMode,
+    OffsiteFailbackPrecheck, OffsiteFailbackRepairMode, OffsiteFailbackRequest,
     OffsiteFailoverLifecycle, OffsiteFailoverRecord, OffsiteFailoverRequest, OffsiteGuestState,
     OffsiteRecoveryPoint, OffsiteReplicationJob, OffsiteReplicationJobStatus,
     OffsiteReplicationRun, OffsiteReplicationRuntimeStatus, OffsiteSshKeygenRequest,
@@ -61,6 +61,20 @@ struct RecoveryPointCatalog {
     points: Vec<OffsiteRecoveryPoint>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+struct RecoveryGuestMetadata {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    source_disks: Vec<RecoveryGuestSourceDisk>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+struct RecoveryGuestSourceDisk {
+    disk_key: String,
+    source_dataset: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 struct ReplicationLifecycleState {
@@ -84,6 +98,39 @@ struct ParsedQemuConfig {
     name: Option<String>,
     settings: Vec<(String, String)>,
     disks: Vec<ParsedQemuDisk>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+struct RepairDatasetBinding {
+    disk_key: String,
+    source_dataset: String,
+    target_dataset: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ZfsSnapshotInfo {
+    name: String,
+    guid: String,
+    clones: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProtectionRepairPlan {
+    mode: OffsiteFailbackRepairMode,
+    common_snapshot: Option<String>,
+    common_guid: Option<String>,
+    rollback_snapshots: Vec<String>,
+    target_tail_snapshots: Vec<String>,
+    reset_datasets: Vec<String>,
+    retry_supported: bool,
+    message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RepairDatasetBindings {
+    Exact(Vec<RepairDatasetBinding>),
+    Unresolved(String),
 }
 
 fn sanitize_id(id: &str) -> String {
@@ -228,6 +275,12 @@ fn recovery_config_path(job_id: &str, snapshot: &str) -> std::path::PathBuf {
     path
 }
 
+fn recovery_metadata_path(job_id: &str, snapshot: &str) -> std::path::PathBuf {
+    let mut path = recovery_config_dir_for_job(job_id);
+    path.push(format!("{}.metadata.json", sanitize_id(snapshot)));
+    path
+}
+
 fn failover_record_id(record: &OffsiteFailoverRecord) -> String {
     format!(
         "{}-{}-{}",
@@ -315,6 +368,7 @@ fn mark_failback_complete(
     recovery_vmid: u32,
     source_restore_vmid: u32,
     target_cleaned: bool,
+    suspend_reason: Option<String>,
 ) -> Result<(), Error> {
     ensure_failover_record_dir()?;
     let path = failover_record_path(job_id);
@@ -336,7 +390,16 @@ fn mark_failback_complete(
         .iter()
         .any(|record| record.lifecycle == OffsiteFailoverLifecycle::Active)
     {
-        if target_cleaned {
+        if let Some(reason) = suspend_reason {
+            save_lifecycle_state(
+                job_id,
+                &ReplicationLifecycleState {
+                    suspended: true,
+                    reason: Some(reason),
+                    record_id: None,
+                },
+            )?;
+        } else if target_cleaned {
             resume_replication_job(job_id)?;
         } else {
             save_lifecycle_state(
@@ -344,7 +407,8 @@ fn mark_failback_complete(
                 &ReplicationLifecycleState {
                     suspended: true,
                     reason: Some(format!(
-                        "failback completed, but promoted VMID {recovery_vmid} remains on the target; remove it before resuming replication"
+                        "failback completed, but {}; scheduled replication stays suspended until cleanup is complete",
+                        retained_target_repair_reason(recovery_vmid)
                     )),
                     record_id: None,
                 },
@@ -913,9 +977,45 @@ fn save_recovery_guest_config(job_id: &str, snapshot: &str, config: &str) -> Res
     )
 }
 
+fn save_recovery_guest_metadata(
+    job_id: &str,
+    snapshot: &str,
+    metadata: &RecoveryGuestMetadata,
+) -> Result<(), Error> {
+    ensure_recovery_config_dir()?;
+    let path = recovery_metadata_path(job_id, snapshot);
+    let parent = path
+        .parent()
+        .context("failed to derive recovery metadata parent directory")?;
+    let mode = nix::sys::stat::Mode::from_bits_truncate(0o0750);
+    let opts = proxmox_product_config::default_create_options().perm(mode);
+    proxmox_sys::fs::create_path(parent, Some(opts), Some(opts))?;
+    let raw = serde_json::to_vec_pretty(metadata)?;
+    proxmox_sys::fs::replace_file(
+        path,
+        &raw,
+        proxmox_product_config::default_create_options(),
+        false,
+    )
+}
+
 pub fn load_recovery_guest_config(job_id: &str, snapshot: &str) -> Result<String, Error> {
     let path = recovery_config_path(job_id, snapshot);
     proxmox_sys::fs::file_read_string(path)
+}
+
+fn load_recovery_guest_metadata(
+    job_id: &str,
+    snapshot: &str,
+) -> Result<RecoveryGuestMetadata, Error> {
+    let content =
+        proxmox_sys::fs::file_read_optional_string(recovery_metadata_path(job_id, snapshot))?
+            .unwrap_or_default();
+    if content.trim().is_empty() {
+        return Ok(RecoveryGuestMetadata::default());
+    }
+
+    Ok(serde_json::from_str(&content)?)
 }
 
 fn run_ssh_script_checked(
@@ -2231,7 +2331,7 @@ fn failover_record_for_recovery(
         })
 }
 
-fn original_source_dataset(
+fn fallback_source_dataset_from_record(
     record: &OffsiteFailoverRecord,
     disk: &ParsedQemuDisk,
 ) -> Result<String, Error> {
@@ -2245,13 +2345,58 @@ fn original_source_dataset(
     Ok(format!("{parent}/{}", disk.source_basename))
 }
 
+fn source_dataset_for_disk(
+    record: &OffsiteFailoverRecord,
+    parsed: &ParsedQemuConfig,
+    metadata: &RecoveryGuestMetadata,
+    disk: &ParsedQemuDisk,
+) -> Result<String, Error> {
+    if let Some(entry) = metadata
+        .source_disks
+        .iter()
+        .find(|entry| entry.disk_key == disk.key)
+    {
+        return Ok(entry.source_dataset.clone());
+    }
+
+    let duplicate_basename = parsed
+        .disks
+        .iter()
+        .filter(|candidate| candidate.source_basename == disk.source_basename)
+        .nth(1)
+        .is_some();
+    if duplicate_basename {
+        bail!(
+            "recovery snapshot '{}' is missing the exact per-disk source dataset identity for duplicate basename '{}' (disk '{}'); manual failback is required for this legacy record",
+            record.source_snapshot,
+            disk.source_basename,
+            disk.key,
+        );
+    }
+
+    fallback_source_dataset_from_record(record, disk)
+}
+
+fn source_snapshot_for_disk(
+    record: &OffsiteFailoverRecord,
+    parsed: &ParsedQemuConfig,
+    metadata: &RecoveryGuestMetadata,
+    disk: &ParsedQemuDisk,
+) -> Result<String, Error> {
+    let source_dataset = source_dataset_for_disk(record, parsed, metadata, disk)?;
+    let suffix = extract_snapshot_suffix(&record.source_snapshot)?;
+    Ok(format!("{source_dataset}@{suffix}"))
+}
+
 fn source_restore_dataset(
     record: &OffsiteFailoverRecord,
+    parsed: &ParsedQemuConfig,
+    metadata: &RecoveryGuestMetadata,
     disk: &ParsedQemuDisk,
     source_vmid: u32,
     restore_vmid: u32,
 ) -> Result<String, Error> {
-    let source_dataset = original_source_dataset(record, disk)?;
+    let source_dataset = source_dataset_for_disk(record, parsed, metadata, disk)?;
     if source_vmid == restore_vmid {
         return Ok(source_dataset);
     }
@@ -2302,6 +2447,545 @@ fn zfs_dataset_from_volid_script(volid: &str) -> String {
         shell_escape(&format!("cannot resolve ZFS dataset for volume '{volid}'")),
         shell_escape(&format!("volume '{volid}' is not backed by a ZFS zvol")),
     )
+}
+
+fn resolve_qemu_source_disk_metadata(
+    job: &OffsiteReplicationJob,
+    parsed: &ParsedQemuConfig,
+) -> Result<RecoveryGuestMetadata, Error> {
+    let mut script = String::from("set -eu\n");
+    for disk in &parsed.disks {
+        script.push_str(&zfs_dataset_from_volid_script(&disk.source_volid));
+        script.push_str(&format!(
+            "printf 'SOURCE_DATASET:%s\\t%s\\n' {} \"$dataset\"\n",
+            shell_escape(&disk.key),
+        ));
+    }
+
+    let output = run_ssh_script_checked(
+        &job.source_remote,
+        &job.source_node,
+        &job.source_user,
+        &job.ssh_private_key,
+        &script,
+    )?;
+
+    let mut datasets = HashMap::new();
+    for raw_line in output.lines() {
+        let line = raw_line.trim();
+        let Some(rest) = line.strip_prefix("SOURCE_DATASET:") else {
+            continue;
+        };
+
+        let mut fields = rest.splitn(2, '\t');
+        let key = fields
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .context("source dataset capture is missing a disk key")?;
+        let dataset = fields
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .context("source dataset capture is missing a dataset")?;
+        datasets.insert(key.to_string(), dataset.to_string());
+    }
+
+    let mut source_disks = Vec::with_capacity(parsed.disks.len());
+    for disk in &parsed.disks {
+        let source_dataset = datasets
+            .remove(&disk.key)
+            .with_context(|| format!("source dataset capture is missing disk '{}'", disk.key))?;
+        source_disks.push(RecoveryGuestSourceDisk {
+            disk_key: disk.key.clone(),
+            source_dataset,
+        });
+    }
+
+    Ok(RecoveryGuestMetadata { source_disks })
+}
+
+fn capture_recovery_guest_metadata(
+    job: &OffsiteReplicationJob,
+    snapshot: &str,
+    config: &str,
+) -> Result<(), Error> {
+    if job.guest_type != pdm_api_types::resource::GuestType::Qemu {
+        return Ok(());
+    }
+
+    let parsed = parse_qemu_config(config, job.vmid)?;
+    let metadata = resolve_qemu_source_disk_metadata(job, &parsed)?;
+    save_recovery_guest_metadata(&job.id, snapshot, &metadata)
+}
+
+fn snapshot_clones(clones: &str) -> Vec<String> {
+    let clones = clones.trim();
+    if clones.is_empty() || clones == "-" {
+        return Vec::new();
+    }
+
+    clones
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty() && *entry != "-")
+        .map(str::to_string)
+        .collect()
+}
+
+fn job_snapshot_prefix(dataset: &str, job_id: &str) -> String {
+    format!("{dataset}@rep_{job_id}_")
+}
+
+fn parse_snapshot_inventory(output: &str) -> Result<HashMap<String, Vec<ZfsSnapshotInfo>>, Error> {
+    let mut inventory: HashMap<String, Vec<ZfsSnapshotInfo>> = HashMap::new();
+    let mut current_dataset: Option<String> = None;
+
+    for raw_line in output.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        if let Some(dataset) = line.strip_prefix("DATASET:") {
+            let dataset = dataset.trim().to_string();
+            inventory.entry(dataset.clone()).or_default();
+            current_dataset = Some(dataset);
+            continue;
+        }
+
+        if line.starts_with("DATASET-MISSING:") {
+            current_dataset = None;
+            continue;
+        }
+
+        let Some(rest) = line.strip_prefix("SNAP:") else {
+            continue;
+        };
+        let dataset = current_dataset
+            .as_ref()
+            .context("received snapshot inventory without a dataset header")?;
+        let mut fields = rest.splitn(3, '\t');
+        let name = fields
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .context("snapshot inventory entry is missing a name")?;
+        let guid = fields
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .context("snapshot inventory entry is missing a GUID")?;
+        let clones = fields.next().unwrap_or("-").trim();
+
+        inventory
+            .entry(dataset.clone())
+            .or_default()
+            .push(ZfsSnapshotInfo {
+                name: name.to_string(),
+                guid: guid.to_string(),
+                clones: snapshot_clones(clones),
+            });
+    }
+
+    Ok(inventory)
+}
+
+fn list_snapshot_inventory(
+    remote: &str,
+    node: &str,
+    user: &str,
+    ssh_private_key: &str,
+    datasets: &[String],
+) -> Result<HashMap<String, Vec<ZfsSnapshotInfo>>, Error> {
+    if datasets.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut script = String::from("set -eu\n");
+    for dataset in datasets {
+        script.push_str(&format!(
+            "if zfs list -H -o name {} >/dev/null 2>&1; then\n  printf 'DATASET:%s\\n' {}\n  zfs list -H -t snapshot -o name -s creation {} 2>/dev/null | while IFS= read -r snap; do\n    [ \"${{snap%@*}}\" = {} ] || continue\n    guid=\"$(zfs get -H -o value guid \"$snap\" 2>/dev/null || echo -)\"\n    clones=\"$(zfs get -H -o value clones \"$snap\" 2>/dev/null || echo -)\"\n    printf 'SNAP:%s\\t%s\\t%s\\n' \"$snap\" \"$guid\" \"$clones\"\n  done\nelse\n  printf 'DATASET-MISSING:%s\\n' {}\nfi\n",
+            shell_escape(dataset),
+            shell_escape(dataset),
+            shell_escape(dataset),
+            shell_escape(dataset),
+            shell_escape(dataset),
+        ));
+    }
+
+    let output = run_ssh_script_checked(remote, node, user, ssh_private_key, &script)?;
+    parse_snapshot_inventory(&output)
+}
+
+fn classify_target_repair_tail(
+    job_id: &str,
+    source_snapshots: &[ZfsSnapshotInfo],
+    target_snapshots: &[ZfsSnapshotInfo],
+) -> ProtectionRepairPlan {
+    let mut source_guids = HashMap::new();
+    for snapshot in source_snapshots {
+        source_guids.insert(snapshot.guid.as_str(), snapshot.name.as_str());
+    }
+
+    let common_index = target_snapshots
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, snapshot)| source_guids.contains_key(snapshot.guid.as_str()))
+        .map(|(index, _)| index);
+
+    let Some(common_index) = common_index else {
+        return ProtectionRepairPlan {
+            mode: OffsiteFailbackRepairMode::FullReseed,
+            common_snapshot: None,
+            common_guid: None,
+            rollback_snapshots: Vec::new(),
+            target_tail_snapshots: Vec::new(),
+            reset_datasets: Vec::new(),
+            retry_supported: false,
+            message: "source and target no longer share a common snapshot GUID; a full reseed is required"
+                .to_string(),
+        };
+    };
+
+    let common_snapshot = &target_snapshots[common_index];
+    let target_tail = &target_snapshots[common_index + 1..];
+    if target_tail.is_empty() {
+        return ProtectionRepairPlan {
+            mode: OffsiteFailbackRepairMode::IncrementalResume,
+            common_snapshot: Some(common_snapshot.name.clone()),
+            common_guid: Some(common_snapshot.guid.clone()),
+            rollback_snapshots: Vec::new(),
+            target_tail_snapshots: Vec::new(),
+            reset_datasets: Vec::new(),
+            retry_supported: true,
+            message: "source and target already share the newest protection snapshot".to_string(),
+        };
+    }
+
+    let prefix = job_snapshot_prefix(
+        common_snapshot
+            .name
+            .rsplit_once('@')
+            .map(|(dataset, _)| dataset)
+            .unwrap_or_default(),
+        job_id,
+    );
+    let safe_tail = target_tail
+        .iter()
+        .all(|snapshot| snapshot.name.starts_with(&prefix) && snapshot.clones.is_empty());
+
+    if safe_tail {
+        return ProtectionRepairPlan {
+            mode: OffsiteFailbackRepairMode::RollbackTail,
+            common_snapshot: Some(common_snapshot.name.clone()),
+            common_guid: Some(common_snapshot.guid.clone()),
+            rollback_snapshots: target_tail
+                .iter()
+                .map(|snapshot| snapshot.name.clone())
+                .collect(),
+            target_tail_snapshots: target_tail.iter().map(|snapshot| snapshot.name.clone()).collect(),
+            reset_datasets: Vec::new(),
+            retry_supported: true,
+            message: "target contains a newer job-owned snapshot tail that can be rolled back before protection resumes"
+                .to_string(),
+        };
+    }
+
+    ProtectionRepairPlan {
+        mode: OffsiteFailbackRepairMode::FullReseed,
+        common_snapshot: Some(common_snapshot.name.clone()),
+        common_guid: Some(common_snapshot.guid.clone()),
+        rollback_snapshots: Vec::new(),
+        target_tail_snapshots: target_tail.iter().map(|snapshot| snapshot.name.clone()).collect(),
+        reset_datasets: Vec::new(),
+        retry_supported: false,
+        message: "target contains divergent snapshots that cannot be rolled back safely; a full reseed is required"
+            .to_string(),
+    }
+}
+
+fn can_reset_target_dataset_for_reseed(
+    job_id: &str,
+    target_dataset: &str,
+    dataset_present: bool,
+    target_snapshots: &[ZfsSnapshotInfo],
+) -> bool {
+    if !dataset_present {
+        return false;
+    }
+
+    let prefix = job_snapshot_prefix(target_dataset, job_id);
+    let has_positive_job_ownership = target_snapshots
+        .iter()
+        .any(|snapshot| snapshot.name.starts_with(&prefix));
+
+    has_positive_job_ownership
+        && target_snapshots
+            .iter()
+            .all(|snapshot| snapshot.name.starts_with(&prefix) && snapshot.clones.is_empty())
+}
+
+fn unresolved_protection_repair_plan(message: String) -> ProtectionRepairPlan {
+    ProtectionRepairPlan {
+        mode: OffsiteFailbackRepairMode::FullReseed,
+        common_snapshot: None,
+        common_guid: None,
+        rollback_snapshots: Vec::new(),
+        target_tail_snapshots: Vec::new(),
+        reset_datasets: Vec::new(),
+        retry_supported: false,
+        message,
+    }
+}
+
+fn combine_repair_plans(plans: Vec<(String, ProtectionRepairPlan)>) -> ProtectionRepairPlan {
+    let mut mode = OffsiteFailbackRepairMode::IncrementalResume;
+    let mut common_snapshot: Option<String> = None;
+    let mut common_guid: Option<String> = None;
+    let mut rollback_snapshots = Vec::new();
+    let mut target_tail_snapshots = Vec::new();
+    let mut reset_datasets = Vec::new();
+    let mut retry_supported = true;
+    let mut messages = Vec::new();
+
+    for (dataset, plan) in plans {
+        messages.push(format!("{dataset}: {}", plan.message));
+        retry_supported &= plan.retry_supported;
+        rollback_snapshots.extend(plan.rollback_snapshots.clone());
+        target_tail_snapshots.extend(plan.target_tail_snapshots.clone());
+        reset_datasets.extend(plan.reset_datasets.clone());
+
+        if common_snapshot.is_none() {
+            common_snapshot = plan.common_snapshot.clone();
+            common_guid = plan.common_guid.clone();
+        } else if common_snapshot != plan.common_snapshot || common_guid != plan.common_guid {
+            common_snapshot = None;
+            common_guid = None;
+        }
+
+        mode = match (mode, plan.mode) {
+            (OffsiteFailbackRepairMode::FullReseed, _)
+            | (_, OffsiteFailbackRepairMode::FullReseed) => OffsiteFailbackRepairMode::FullReseed,
+            (OffsiteFailbackRepairMode::RollbackTail, _)
+            | (_, OffsiteFailbackRepairMode::RollbackTail) => {
+                OffsiteFailbackRepairMode::RollbackTail
+            }
+            _ => OffsiteFailbackRepairMode::IncrementalResume,
+        };
+    }
+
+    ProtectionRepairPlan {
+        mode,
+        common_snapshot,
+        common_guid,
+        rollback_snapshots,
+        target_tail_snapshots,
+        reset_datasets,
+        retry_supported,
+        message: messages.join("; "),
+    }
+}
+
+fn exact_target_dataset_from_origin(origin: &str, target_dataset: &str) -> Option<String> {
+    let (dataset, _) = origin.rsplit_once('@')?;
+    let target_prefix = format!("{target_dataset}/");
+    if dataset == target_dataset || dataset.starts_with(&target_prefix) {
+        Some(dataset.to_string())
+    } else {
+        None
+    }
+}
+
+fn repair_dataset_bindings_from_promotion(
+    job: &OffsiteReplicationJob,
+    record: &OffsiteFailoverRecord,
+    parsed: &ParsedQemuConfig,
+    metadata: &RecoveryGuestMetadata,
+) -> Result<RepairDatasetBindings, Error> {
+    let promoted = fetch_qemu_config(
+        &job.target_remote,
+        &job.target_node,
+        &job.target_user,
+        &job.ssh_private_key,
+        record.recovery_vmid,
+    )?;
+    let promoted = parse_qemu_config(&promoted, record.recovery_vmid)?;
+
+    let mut script = String::from("set -eu\n");
+    for disk in &parsed.disks {
+        let promoted_disk = matching_disk(&promoted.disks, &disk.key, "promoted recovery guest")?;
+        script.push_str(&zfs_dataset_from_volid_script(&promoted_disk.source_volid));
+        script.push_str(&format!(
+            "origin=$(zfs get -H -o value origin \"$dataset\" 2>/dev/null || echo -)\nprintf 'PROMOTED_ORIGIN:%s\\t%s\\n' {} \"$origin\"\n",
+            shell_escape(&disk.key),
+        ));
+    }
+
+    let output = run_ssh_script_checked(
+        &job.target_remote,
+        &job.target_node,
+        &job.target_user,
+        &job.ssh_private_key,
+        &script,
+    )?;
+
+    let mut origins = HashMap::new();
+    for raw_line in output.lines() {
+        let line = raw_line.trim();
+        let Some(rest) = line.strip_prefix("PROMOTED_ORIGIN:") else {
+            continue;
+        };
+        let mut fields = rest.splitn(2, '\t');
+        let key = fields
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .context("promoted origin output is missing a disk key")?;
+        let origin = fields
+            .next()
+            .map(str::trim)
+            .context("promoted origin output is missing an origin")?;
+        origins.insert(key.to_string(), origin.to_string());
+    }
+
+    let mut bindings = Vec::with_capacity(parsed.disks.len());
+    for disk in &parsed.disks {
+        let source_dataset = source_dataset_for_disk(record, parsed, metadata, disk)?;
+        let origin = origins.get(&disk.key).with_context(|| {
+            format!(
+                "promoted recovery guest is missing origin information for disk '{}'",
+                disk.key
+            )
+        })?;
+        if origin == "-" {
+            return Ok(RepairDatasetBindings::Unresolved(format!(
+                "promoted disk '{}' no longer records the replica snapshot it was cloned from",
+                disk.key
+            )));
+        }
+        let Some(target_dataset) = exact_target_dataset_from_origin(origin, &job.target_dataset)
+        else {
+            return Ok(RepairDatasetBindings::Unresolved(format!(
+                "promoted disk '{}' points at origin '{}' outside target dataset '{}'",
+                disk.key, origin, job.target_dataset
+            )));
+        };
+        bindings.push(RepairDatasetBinding {
+            disk_key: disk.key.clone(),
+            source_dataset,
+            target_dataset,
+        });
+    }
+
+    Ok(RepairDatasetBindings::Exact(bindings))
+}
+
+fn build_source_target_repair_plan(
+    job_id: &str,
+    bindings: &[RepairDatasetBinding],
+    source_inventory: &HashMap<String, Vec<ZfsSnapshotInfo>>,
+    target_inventory: &HashMap<String, Vec<ZfsSnapshotInfo>>,
+) -> ProtectionRepairPlan {
+    let mut dataset_plans = Vec::new();
+    for binding in bindings {
+        let source_snapshots = source_inventory
+            .get(&binding.source_dataset)
+            .cloned()
+            .unwrap_or_default();
+        let target_snapshots = target_inventory
+            .get(&binding.target_dataset)
+            .cloned()
+            .unwrap_or_default();
+        let mut plan = classify_target_repair_tail(job_id, &source_snapshots, &target_snapshots);
+
+        if plan.mode == OffsiteFailbackRepairMode::FullReseed {
+            let safe_reset = can_reset_target_dataset_for_reseed(
+                job_id,
+                &binding.target_dataset,
+                target_inventory.contains_key(&binding.target_dataset),
+                &target_snapshots,
+            );
+            if safe_reset {
+                plan.reset_datasets.push(binding.target_dataset.clone());
+                plan.retry_supported = true;
+                if plan.common_snapshot.is_none() {
+                    plan.message =
+                        "target can be reset safely, but a full reseed is required".to_string();
+                } else {
+                    plan.message = format!(
+                        "{}; target can be reset safely for a full reseed",
+                        plan.message
+                    );
+                }
+            }
+        }
+
+        dataset_plans.push((binding.target_dataset.clone(), plan));
+    }
+
+    combine_repair_plans(dataset_plans)
+}
+
+fn source_target_repair_plan_from_bindings(
+    job: &OffsiteReplicationJob,
+    bindings: &[RepairDatasetBinding],
+) -> Result<ProtectionRepairPlan, Error> {
+    let mut source_datasets = Vec::new();
+    let mut seen_source = HashSet::new();
+    let mut target_datasets = Vec::new();
+    let mut seen_target = HashSet::new();
+    for binding in bindings {
+        if seen_source.insert(binding.source_dataset.clone()) {
+            source_datasets.push(binding.source_dataset.clone());
+        }
+        if seen_target.insert(binding.target_dataset.clone()) {
+            target_datasets.push(binding.target_dataset.clone());
+        }
+    }
+
+    let source_inventory = list_snapshot_inventory(
+        &job.source_remote,
+        &job.source_node,
+        &job.source_user,
+        &job.ssh_private_key,
+        &source_datasets,
+    )?;
+    let target_inventory = list_snapshot_inventory(
+        &job.target_remote,
+        &job.target_node,
+        &job.target_user,
+        &job.ssh_private_key,
+        &target_datasets,
+    )?;
+
+    Ok(build_source_target_repair_plan(
+        &job.id,
+        bindings,
+        &source_inventory,
+        &target_inventory,
+    ))
+}
+
+fn source_target_repair_plan(
+    job: &OffsiteReplicationJob,
+    record: &OffsiteFailoverRecord,
+    parsed: &ParsedQemuConfig,
+    metadata: &RecoveryGuestMetadata,
+) -> Result<(ProtectionRepairPlan, Vec<RepairDatasetBinding>), Error> {
+    match repair_dataset_bindings_from_promotion(job, record, parsed, metadata)? {
+        RepairDatasetBindings::Exact(bindings) => {
+            let plan = source_target_repair_plan_from_bindings(job, &bindings)?;
+            Ok((plan, bindings))
+        }
+        RepairDatasetBindings::Unresolved(message) => Ok((
+            unresolved_protection_repair_plan(format!(
+                "automatic protection repair could not verify the exact target replica datasets recorded during promotion: {message}"
+            )),
+            Vec::new(),
+        )),
+    }
 }
 
 fn reconcile_failover_record(
@@ -2455,10 +3139,12 @@ fn failback_precheck_inner(
     request: &OffsiteFailbackRequest,
 ) -> Result<OffsiteFailbackPrecheck, Error> {
     validate_runtime_job(job)?;
+    ensure_replace_original_restore_vmid(job, request)?;
 
     let record = failover_record_for_recovery(&job.id, request.recovery_vmid)?;
     let stored_config = load_recovery_guest_config(&job.id, &record.source_snapshot)?;
     let parsed = parse_qemu_config(&stored_config, job.vmid)?;
+    let metadata = load_recovery_guest_metadata(&job.id, &record.source_snapshot)?;
     let promoted_config = fetch_qemu_config(
         &job.target_remote,
         &job.target_node,
@@ -2468,14 +3154,14 @@ fn failback_precheck_inner(
     )?;
     let promoted = parse_qemu_config(&promoted_config, request.recovery_vmid)?;
     let base_suffix = extract_snapshot_suffix(&record.source_snapshot)?;
+    let (repair_plan, _) = source_target_repair_plan(job, &record, &parsed, &metadata)?;
     let (source_host, source_port) = resolve_node_host(&job.source_remote, &job.source_node)?;
     let source_ssh = ssh_target_for_script(&job.source_user, &source_host);
     let source_port_args = ssh_port_args_for_script(source_port);
 
     let mut script = String::from("set -eu\nincremental=1\n");
     for disk in &parsed.disks {
-        let source_dataset = original_source_dataset(&record, disk)?;
-        let source_base = format!("{source_dataset}@{base_suffix}");
+        let source_base = source_snapshot_for_disk(&record, &parsed, &metadata, disk)?;
         let promoted_disk = matching_disk(&promoted.disks, &disk.key, "promoted recovery guest")?;
         script.push_str(&zfs_dataset_from_volid_script(&promoted_disk.source_volid));
         script.push_str(&format!(
@@ -2537,20 +3223,15 @@ fn failback_precheck_inner(
             .find_map(|line| line.strip_prefix("RECOVERY_GUEST_STATUS:"))
             .map(|status| status.contains("status: running"))
             .unwrap_or(false);
-        let lineage_incremental = output_text
+        let incremental = output_text
             .lines()
             .any(|line| line.trim() == "INCREMENTAL:1");
-        let incremental = lineage_incremental
-            && request.restore_mode == OffsiteFailbackRestoreMode::ReplaceOriginal;
-        let message = if request.restore_mode == OffsiteFailbackRestoreMode::RestoreAsNew {
-            "restore-as-new uses an explicit full transfer to create independent source datasets"
-                .to_string()
-        } else if !incremental {
+        let message = if !incremental {
             "promoted guest has no compatible clone lineage; an explicit full failback is required"
                 .to_string()
         } else if source_guest_exists {
             format!(
-                "incremental failback is available, but source restore VMID {} already exists; choose replacement or another VMID",
+                "incremental failback is available, but source VMID {} already exists; confirm replacement before failback",
                 request.restore_vmid,
             )
         } else {
@@ -2560,11 +3241,15 @@ fn failback_precheck_inner(
             incremental,
             common_snapshot: incremental.then_some(record.source_snapshot),
             full_required: !incremental,
+            repair_mode: repair_plan.mode,
+            repair_snapshot: repair_plan.common_snapshot.clone(),
+            repair_snapshot_guid: repair_plan.common_guid.clone(),
+            repair_target_snapshots: repair_plan.target_tail_snapshots.clone(),
+            repair_requires_full_reseed: repair_plan.mode == OffsiteFailbackRepairMode::FullReseed,
             source_guest_exists,
             source_guest_running,
             recovery_guest_running,
-            suggested_restore_vmid: job.vmid.saturating_add(1_000),
-            message,
+            message: format!("{message}; {}", repair_plan.message),
         })
     } else {
         let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -2572,14 +3257,21 @@ fn failback_precheck_inner(
             incremental: false,
             common_snapshot: None,
             full_required: true,
+            repair_mode: repair_plan.mode,
+            repair_snapshot: repair_plan.common_snapshot.clone(),
+            repair_snapshot_guid: repair_plan.common_guid.clone(),
+            repair_target_snapshots: repair_plan.target_tail_snapshots.clone(),
+            repair_requires_full_reseed: repair_plan.mode == OffsiteFailbackRepairMode::FullReseed,
             source_guest_exists: false,
             source_guest_running: false,
             recovery_guest_running: false,
-            suggested_restore_vmid: job.vmid.saturating_add(1_000),
             message: if message.is_empty() {
-                "common failback snapshot is missing; full failback is required".to_string()
+                format!(
+                    "common failback snapshot is missing; full failback is required; {}",
+                    repair_plan.message
+                )
             } else {
-                message
+                format!("{message}; {}", repair_plan.message)
             },
         })
     }
@@ -2704,6 +3396,7 @@ fn build_failback_source_prepare_script(
     request: &OffsiteFailbackRequest,
     record: &OffsiteFailoverRecord,
     parsed: &ParsedQemuConfig,
+    metadata: &RecoveryGuestMetadata,
     incremental: bool,
     token: &str,
 ) -> Result<String, Error> {
@@ -2713,7 +3406,7 @@ fn build_failback_source_prepare_script(
         "if qm status {} >/dev/null 2>&1; then\n",
         target_vmid
     ));
-    if request.restore_mode == OffsiteFailbackRestoreMode::ReplaceOriginal && request.force {
+    if request.force {
         script.push_str("  :\n");
     } else {
         script.push_str(&format!(
@@ -2725,9 +3418,15 @@ fn build_failback_source_prepare_script(
         ));
     }
     script.push_str("fi\n");
-    let base_suffix = extract_snapshot_suffix(&record.source_snapshot)?;
     for disk in &parsed.disks {
-        let destination = source_restore_dataset(record, disk, job.vmid, request.restore_vmid)?;
+        let destination = source_restore_dataset(
+            record,
+            parsed,
+            metadata,
+            disk,
+            job.vmid,
+            request.restore_vmid,
+        )?;
         let staging = failback_staging_dataset(&destination, token)?;
         script.push_str(&format!(
             "if zfs list -H -o name {} >/dev/null 2>&1; then echo {} >&2; exit 1; fi\n",
@@ -2736,17 +3435,8 @@ fn build_failback_source_prepare_script(
                 "failback staging dataset '{staging}' already exists"
             )),
         ));
-        if request.restore_mode == OffsiteFailbackRestoreMode::RestoreAsNew {
-            script.push_str(&format!(
-                "if zfs list -H -o name {} >/dev/null 2>&1; then echo {} >&2; exit 1; fi\n",
-                shell_escape(&destination),
-                shell_escape(&format!(
-                    "restore destination dataset '{destination}' already exists"
-                )),
-            ));
-        }
         if incremental {
-            let source_base = format!("{}@{base_suffix}", original_source_dataset(record, disk)?);
+            let source_base = source_snapshot_for_disk(record, parsed, metadata, disk)?;
             // A clone cannot accept the incremental receive; seed an independent matching base.
             script.push_str(&format!(
                 "zfs list -H -o name {} >/dev/null\nzfs send -w {} | zfs recv -u {}\n",
@@ -2764,11 +3454,19 @@ fn build_failback_staging_cleanup_script(
     request: &OffsiteFailbackRequest,
     record: &OffsiteFailoverRecord,
     parsed: &ParsedQemuConfig,
+    metadata: &RecoveryGuestMetadata,
     token: &str,
 ) -> Result<String, Error> {
     let mut script = String::from("set -eu\n");
     for disk in &parsed.disks {
-        let destination = source_restore_dataset(record, disk, job.vmid, request.restore_vmid)?;
+        let destination = source_restore_dataset(
+            record,
+            parsed,
+            metadata,
+            disk,
+            job.vmid,
+            request.restore_vmid,
+        )?;
         let staging = failback_staging_dataset(&destination, token)?;
         script.push_str(&format!(
             "zfs list -H -o name {} >/dev/null 2>&1 && zfs destroy -r {} || true\n",
@@ -2784,25 +3482,29 @@ fn build_failback_cutover_script(
     request: &OffsiteFailbackRequest,
     record: &OffsiteFailoverRecord,
     parsed: &ParsedQemuConfig,
+    metadata: &RecoveryGuestMetadata,
     token: &str,
 ) -> Result<String, Error> {
     let mut script = String::from("set -euo pipefail\n");
-    if request.restore_mode == OffsiteFailbackRestoreMode::ReplaceOriginal {
-        script.push_str(&format!(
-            "if qm status {} >/dev/null 2>&1; then\n  qm stop {} >/dev/null 2>&1 || true\n  qm destroy {} --purge 1\nfi\n",
-            request.restore_vmid, request.restore_vmid, request.restore_vmid,
-        ));
-    }
+    script.push_str(&format!(
+        "if qm status {} >/dev/null 2>&1; then\n  qm stop {} >/dev/null 2>&1 || true\n  qm destroy {} --purge 1\nfi\n",
+        request.restore_vmid, request.restore_vmid, request.restore_vmid,
+    ));
     for disk in &parsed.disks {
-        let destination = source_restore_dataset(record, disk, job.vmid, request.restore_vmid)?;
+        let destination = source_restore_dataset(
+            record,
+            parsed,
+            metadata,
+            disk,
+            job.vmid,
+            request.restore_vmid,
+        )?;
         let staging = failback_staging_dataset(&destination, token)?;
-        if request.restore_mode == OffsiteFailbackRestoreMode::ReplaceOriginal {
-            script.push_str(&format!(
-                "zfs list -H -o name {} >/dev/null 2>&1 && zfs destroy -r {} || true\n",
-                shell_escape(&destination),
-                shell_escape(&destination),
-            ));
-        }
+        script.push_str(&format!(
+            "zfs list -H -o name {} >/dev/null 2>&1 && zfs destroy -r {} || true\n",
+            shell_escape(&destination),
+            shell_escape(&destination),
+        ));
         script.push_str(&format!(
             "zfs rename {} {}\n",
             shell_escape(&staging),
@@ -2812,51 +3514,137 @@ fn build_failback_cutover_script(
     Ok(script)
 }
 
-fn build_full_failback_target_reset_script(
+#[derive(Debug, Clone)]
+struct FailbackExecutionResult {
+    output: String,
+    target_cleaned: bool,
+    suspend_reason: Option<String>,
+}
+
+fn ensure_replace_original_restore_vmid(
     job: &OffsiteReplicationJob,
-    record: &OffsiteFailoverRecord,
-    parsed: &ParsedQemuConfig,
-) -> Result<String, Error> {
-    let mut datasets = HashSet::new();
-    if let Some((dataset, _)) = record.target_snapshot.rsplit_once('@') {
-        datasets.insert(dataset.to_string());
-    }
-    for disk in &parsed.disks {
-        let source_dataset = original_source_dataset(record, disk)?;
-        datasets.insert(target_dataset_for_source_dataset(
-            &job.target_dataset,
-            &source_dataset,
-        ));
-        datasets.insert(legacy_target_dataset_for_source_dataset(
-            &job.target_dataset,
-            &source_dataset,
-        ));
+    request: &OffsiteFailbackRequest,
+) -> Result<(), Error> {
+    if request.restore_vmid != job.vmid {
+        bail!(
+            "failback requires restore VMID {} to match replication job '{}' source VMID {}",
+            request.restore_vmid,
+            job.id,
+            job.vmid,
+        );
     }
 
-    let mut datasets: Vec<String> = datasets.into_iter().collect();
-    datasets.sort();
-    let mut script = String::new();
-    for dataset in datasets {
-        let snapshot_prefix = format!("{dataset}@rep_{}_", job.id);
+    Ok(())
+}
+
+fn validate_failback_execution_precheck(
+    job: &OffsiteReplicationJob,
+    request: &OffsiteFailbackRequest,
+    precheck: &OffsiteFailbackPrecheck,
+) -> Result<(), Error> {
+    ensure_replace_original_restore_vmid(job, request)?;
+
+    if !precheck.incremental && !request.allow_full {
+        bail!("{}", precheck.message);
+    }
+
+    if precheck.repair_requires_full_reseed && !request.allow_full {
+        bail!("{}", precheck.message);
+    }
+
+    if precheck.source_guest_exists && !request.force {
+        bail!(
+            "source VMID {} exists; confirm replacement before failback",
+            request.restore_vmid
+        );
+    }
+
+    Ok(())
+}
+
+fn build_target_repair_script(plan: &ProtectionRepairPlan) -> String {
+    let mut script = String::from("set -euo pipefail\n");
+    for snapshot in plan.rollback_snapshots.iter().rev() {
         script.push_str(&format!(
-            "if zfs list -H -o name {} >/dev/null 2>&1; then\n  foreign=$(zfs list -H -t snapshot -o name -r {} 2>/dev/null | awk -v prefix={} 'index($0, prefix) != 1 {{ print; exit }}')\n  if [ -n \"$foreign\" ]; then\n    echo {} >&2\n    exit 1\n  fi\n  zfs destroy -r {}\nfi\n",
-            shell_escape(&dataset),
-            shell_escape(&dataset),
-            shell_escape(&snapshot_prefix),
-            shell_escape(&format!(
-                "cannot reset replication dataset '{dataset}' after full failback because it contains snapshots outside job '{}'",
-                job.id
-            )),
-            shell_escape(&dataset),
+            "if zfs list -H -o name {} >/dev/null 2>&1; then zfs destroy {}; fi\n",
+            shell_escape(snapshot),
+            shell_escape(snapshot),
         ));
     }
-    Ok(script)
+    for dataset in &plan.reset_datasets {
+        script.push_str(&format!(
+            "if zfs list -H -o name {} >/dev/null 2>&1; then zfs destroy -r {}; fi\n",
+            shell_escape(dataset),
+            shell_escape(dataset),
+        ));
+    }
+    script
+}
+
+fn retained_target_repair_reason(recovery_vmid: u32) -> String {
+    format!(
+        "promoted VMID {recovery_vmid} and its promoted target datasets are still retained on the target; remove them before protection sync can safely modify the job-owned target replica datasets"
+    )
+}
+
+fn protection_repair_reason(plan: &ProtectionRepairPlan) -> String {
+    match plan.mode {
+        OffsiteFailbackRepairMode::IncrementalResume => {
+            "failback completed, but one protection sync must succeed before scheduled replication resumes"
+                .to_string()
+        }
+        OffsiteFailbackRepairMode::RollbackTail => format!(
+            "failback completed, but {} divergent target snapshot(s) must be rolled back before scheduled replication resumes",
+            plan.target_tail_snapshots.len()
+        ),
+        OffsiteFailbackRepairMode::FullReseed => {
+            "failback completed, but a full target reseed is required before scheduled replication resumes"
+                .to_string()
+        }
+    }
+}
+
+fn attempt_protection_repair(
+    job: &OffsiteReplicationJob,
+    plan: &ProtectionRepairPlan,
+    allow_full: bool,
+) -> Result<String, Error> {
+    if !plan.retry_supported {
+        bail!("automatic protection repair is unavailable for the current target state");
+    }
+    if plan.mode == OffsiteFailbackRepairMode::FullReseed && !allow_full {
+        bail!("a full reseed is required, but it was not explicitly authorized");
+    }
+
+    let cleanup_output = match plan.mode {
+        OffsiteFailbackRepairMode::IncrementalResume => String::new(),
+        _ => run_ssh_script_checked(
+            &job.target_remote,
+            &job.target_node,
+            &job.target_user,
+            &job.ssh_private_key,
+            &build_target_repair_script(plan),
+        )?,
+    };
+
+    let (task_state, sync_output) = run_over_ssh(job)?;
+    match task_state {
+        TaskState::OK { .. } => {
+            if cleanup_output.trim().is_empty() {
+                Ok(sync_output)
+            } else {
+                Ok(format!("{cleanup_output}\n{sync_output}"))
+            }
+        }
+        TaskState::Error { message, .. } => bail!("{message}"),
+        other => bail!("unexpected replication task state: {other}"),
+    }
 }
 
 fn execute_failback(
     job: &OffsiteReplicationJob,
     request: &OffsiteFailbackRequest,
-) -> Result<String, Error> {
+) -> Result<FailbackExecutionResult, Error> {
     validate_runtime_job(job)?;
     if let Some(name) = request.recovered_name.as_deref() {
         verify_offsite_recovered_name(name)?;
@@ -2867,22 +3655,12 @@ fn execute_failback(
     }
 
     let precheck = failback_precheck_inner(job, request)?;
-    if !precheck.incremental && !request.allow_full {
-        bail!("{}", precheck.message);
-    }
-    if request.restore_mode == OffsiteFailbackRestoreMode::ReplaceOriginal
-        && precheck.source_guest_exists
-        && !request.force
-    {
-        bail!(
-            "source VMID {} exists; confirm replacement before failback",
-            request.restore_vmid
-        );
-    }
+    validate_failback_execution_precheck(job, request, &precheck)?;
 
     let record = failover_record_for_recovery(&job.id, request.recovery_vmid)?;
     let stored_config = load_recovery_guest_config(&job.id, &record.source_snapshot)?;
     let parsed = parse_qemu_config(&stored_config, job.vmid)?;
+    let metadata = load_recovery_guest_metadata(&job.id, &record.source_snapshot)?;
     let promoted_config = fetch_qemu_config(
         &job.target_remote,
         &job.target_node,
@@ -2891,19 +3669,20 @@ fn execute_failback(
         request.recovery_vmid,
     )?;
     let promoted = parse_qemu_config(&promoted_config, request.recovery_vmid)?;
+    let (repair_plan, _) = source_target_repair_plan(job, &record, &parsed, &metadata)?;
     let (source_host, source_port) = resolve_node_host(&job.source_remote, &job.source_node)?;
     let source_ssh = ssh_target_for_script(&job.source_user, &source_host);
     let source_port_args = ssh_port_args_for_script(source_port);
 
     let token = format!("{}-{}", sanitize_id(&job.id), proxmox_time::epoch_i64());
     let snapshot_tag = format!("failback_{token}");
-    let incremental_transfer =
-        precheck.incremental && request.restore_mode == OffsiteFailbackRestoreMode::ReplaceOriginal;
+    let incremental_transfer = precheck.incremental;
     let prepare_script = build_failback_source_prepare_script(
         job,
         request,
         &record,
         &parsed,
+        &metadata,
         incremental_transfer,
         &token,
     )?;
@@ -2922,8 +3701,14 @@ fn execute_failback(
     ));
     for disk in &parsed.disks {
         let promoted_disk = matching_disk(&promoted.disks, &disk.key, "promoted recovery guest")?;
-        let destination_dataset =
-            source_restore_dataset(&record, disk, job.vmid, request.restore_vmid)?;
+        let destination_dataset = source_restore_dataset(
+            &record,
+            &parsed,
+            &metadata,
+            disk,
+            job.vmid,
+            request.restore_vmid,
+        )?;
         let staging_dataset = failback_staging_dataset(&destination_dataset, &token)?;
 
         transfer_script.push_str(&zfs_dataset_from_volid_script(&promoted_disk.source_volid));
@@ -2957,8 +3742,9 @@ fn execute_failback(
     ) {
         Ok(output) => output,
         Err(err) => {
-            let cleanup_script =
-                build_failback_staging_cleanup_script(job, request, &record, &parsed, &token)?;
+            let cleanup_script = build_failback_staging_cleanup_script(
+                job, request, &record, &parsed, &metadata, &token,
+            )?;
             if let Err(cleanup_err) = run_ssh_script_checked(
                 &job.source_remote,
                 &job.source_node,
@@ -2971,7 +3757,8 @@ fn execute_failback(
             return Err(err);
         }
     };
-    let cutover_script = build_failback_cutover_script(job, request, &record, &parsed, &token)?;
+    let cutover_script =
+        build_failback_cutover_script(job, request, &record, &parsed, &metadata, &token)?;
     let cutover_output = run_ssh_script_checked(
         &job.source_remote,
         &job.source_node,
@@ -2989,17 +3776,10 @@ fn execute_failback(
     )?;
 
     let cleanup_output = if request.cleanup_target {
-        let mut cleanup_script = format!(
+        let cleanup_script = format!(
             "set -euo pipefail\nqm destroy {} --purge 1\n",
             request.recovery_vmid
         );
-        if !incremental_transfer
-            && request.restore_mode == OffsiteFailbackRestoreMode::ReplaceOriginal
-        {
-            cleanup_script.push_str(&build_full_failback_target_reset_script(
-                job, &record, &parsed,
-            )?);
-        }
         run_ssh_script_checked(
             &job.target_remote,
             &job.target_node,
@@ -3011,9 +3791,41 @@ fn execute_failback(
         "kept stopped promoted guest on target for validation".to_string()
     };
 
-    Ok(format!(
-        "{prepare_output}\n{transfer_output}\n{cutover_output}\n{register_output}\n{cleanup_output}"
-    ))
+    let mut combined_output =
+        format!("{prepare_output}\n{transfer_output}\n{cutover_output}\n{register_output}\n{cleanup_output}");
+    let suspend_reason = if request.cleanup_target {
+        match attempt_protection_repair(job, &repair_plan, request.allow_full) {
+            Ok(repair_output) => {
+                if !repair_output.trim().is_empty() {
+                    combined_output.push('\n');
+                    combined_output.push_str(&repair_output);
+                }
+                None
+            }
+            Err(err) => {
+                combined_output.push('\n');
+                combined_output.push_str(&format!(
+                    "WARNING: protection repair is still required: {err}\n"
+                ));
+                Some(format!(
+                    "{}; last repair attempt: {err}",
+                    protection_repair_reason(&repair_plan)
+                ))
+            }
+        }
+    } else {
+        Some(format!(
+            "failback completed, but {}; {}",
+            retained_target_repair_reason(request.recovery_vmid),
+            protection_repair_reason(&repair_plan)
+        ))
+    };
+
+    Ok(FailbackExecutionResult {
+        output: combined_output,
+        target_cleaned: request.cleanup_target,
+        suspend_reason,
+    })
 }
 
 fn validate_runtime_job(job: &OffsiteReplicationJob) -> Result<(), Error> {
@@ -3368,6 +4180,7 @@ fn run_over_ssh(job: &OffsiteReplicationJob) -> Result<(TaskState, String), Erro
                 .context("replication succeeded but no recovery snapshot was recorded")?;
             let config = fetch_guest_config(job)?;
             save_recovery_guest_config(&job.id, snapshot, &config)?;
+            capture_recovery_guest_metadata(job, snapshot, &config)?;
             Ok(())
         })();
 
@@ -3650,6 +4463,17 @@ pub fn delete_recovery_point(
                 format!(
                     "failed to remove recovery config '{}' after snapshot deletion",
                     config_path.display()
+                )
+            });
+        }
+    }
+    let metadata_path = recovery_metadata_path(&job.id, source_snapshot);
+    if let Err(err) = std::fs::remove_file(&metadata_path) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to remove recovery metadata '{}' after snapshot deletion",
+                    metadata_path.display()
                 )
             });
         }
@@ -4006,6 +4830,7 @@ pub fn run_failback_now(
     if let Some(name) = request.recovered_name.as_deref() {
         verify_offsite_recovered_name(name)?;
     }
+    ensure_replace_original_restore_vmid(&job, &request)?;
 
     let worker_name = format!("{}-{}", job.id, request.recovery_vmid);
     let failback_guard = Job::new(FAILBACK_WORKER_TYPE, &worker_name).with_context(|| {
@@ -4030,15 +4855,16 @@ pub fn run_failback_now(
                 request.recovery_vmid
             );
 
-            let output = execute_failback(&job, &request)?;
+            let result = execute_failback(&job, &request)?;
             mark_failback_complete(
                 &job.id,
                 request.recovery_vmid,
                 request.restore_vmid,
-                request.cleanup_target,
+                result.target_cleaned,
+                result.suspend_reason.clone(),
             )?;
-            if !output.trim().is_empty() {
-                for line in output.lines() {
+            if !result.output.trim().is_empty() {
+                for line in result.output.lines() {
                     println!("{line}");
                 }
             }
@@ -4137,6 +4963,23 @@ mod tests {
             .expect("config should parse")
     }
 
+    fn sample_recovery_guest_metadata() -> RecoveryGuestMetadata {
+        RecoveryGuestMetadata {
+            source_disks: vec![RecoveryGuestSourceDisk {
+                disk_key: "scsi0".to_string(),
+                source_dataset: "tank/vmdata/vm-100-disk-0".to_string(),
+            }],
+        }
+    }
+
+    fn snapshot(name: &str, guid: &str, clones: &[&str]) -> ZfsSnapshotInfo {
+        ZfsSnapshotInfo {
+            name: name.to_string(),
+            guid: guid.to_string(),
+            clones: clones.iter().map(|clone| clone.to_string()).collect(),
+        }
+    }
+
     #[test]
     fn test_sanitize_id() {
         assert_eq!(sanitize_id("job-1"), "job-1");
@@ -4173,7 +5016,6 @@ mod tests {
         let request = OffsiteFailbackRequest {
             recovery_vmid: 500,
             restore_vmid: 100,
-            restore_mode: OffsiteFailbackRestoreMode::ReplaceOriginal,
             recovered_name: None,
             start_guest: false,
             allow_full: false,
@@ -4183,9 +5025,11 @@ mod tests {
 
         let record = sample_failover_record();
         let parsed = sample_parsed_qemu_config();
-        let safe_script =
-            build_failback_source_prepare_script(&job, &request, &record, &parsed, true, "test")
-                .expect("safe prepare script should build");
+        let metadata = sample_recovery_guest_metadata();
+        let safe_script = build_failback_source_prepare_script(
+            &job, &request, &record, &parsed, &metadata, true, "test",
+        )
+        .expect("safe prepare script should build");
         assert!(safe_script.contains("target VMID 100 already exists on original source node"));
         assert!(!safe_script.contains("qm destroy 100 --purge 1"));
 
@@ -4198,6 +5042,7 @@ mod tests {
             &replace_request,
             &record,
             &parsed,
+            &metadata,
             true,
             "test",
         )
@@ -4207,9 +5052,15 @@ mod tests {
         assert!(!replace_script.contains("zfs clone"));
         assert!(!replace_script.contains("qm destroy 100 --purge 1"));
 
-        let cutover =
-            build_failback_cutover_script(&job, &replace_request, &record, &parsed, "test")
-                .expect("cutover script should build");
+        let cutover = build_failback_cutover_script(
+            &job,
+            &replace_request,
+            &record,
+            &parsed,
+            &metadata,
+            "test",
+        )
+        .expect("cutover script should build");
         assert!(!cutover.contains("zfs promote"));
         let destroy = cutover
             .find("qm destroy 100 --purge 1")
@@ -4246,39 +5097,11 @@ mod tests {
     }
 
     #[test]
-    fn test_failback_source_prepare_keeps_existing_source_for_restore_as_new() {
-        let job = sample_job(GuestType::Qemu);
-        let request = OffsiteFailbackRequest {
-            recovery_vmid: 500,
-            restore_vmid: 1_100,
-            restore_mode: OffsiteFailbackRestoreMode::RestoreAsNew,
-            recovered_name: None,
-            start_guest: false,
-            allow_full: true,
-            force: true,
-            cleanup_target: false,
-        };
-
-        let script = build_failback_source_prepare_script(
-            &job,
-            &request,
-            &sample_failover_record(),
-            &sample_parsed_qemu_config(),
-            false,
-            "test",
-        )
-        .expect("restore-as-new prepare script should build");
-        assert!(script.contains("qm status 1100"));
-        assert!(!script.contains("qm destroy 1100 --purge 1"));
-    }
-
-    #[test]
     fn test_full_failback_stages_data_before_replacing_source() {
         let job = sample_job(GuestType::Qemu);
         let request = OffsiteFailbackRequest {
             recovery_vmid: 500,
             restore_vmid: 100,
-            restore_mode: OffsiteFailbackRestoreMode::ReplaceOriginal,
             recovered_name: None,
             start_guest: false,
             allow_full: true,
@@ -4287,21 +5110,23 @@ mod tests {
         };
         let record = sample_failover_record();
         let parsed = sample_parsed_qemu_config();
+        let metadata = sample_recovery_guest_metadata();
 
         let prepare = build_failback_source_prepare_script(
             &job,
             &request,
             &record,
             &parsed,
+            &metadata,
             false,
             "full-test",
         )
         .expect("full failback prepare script should build");
         assert!(prepare.contains("pdm-failback-full-test"));
         assert!(!prepare.contains("qm destroy 100 --purge 1"));
-
-        let cutover = build_failback_cutover_script(&job, &request, &record, &parsed, "full-test")
-            .expect("full failback cutover script should build");
+        let cutover =
+            build_failback_cutover_script(&job, &request, &record, &parsed, &metadata, "full-test")
+                .expect("full failback cutover script should build");
         let destroy = cutover
             .find("qm destroy 100 --purge 1")
             .expect("source replacement happens during cutover");
@@ -4312,18 +5137,370 @@ mod tests {
     }
 
     #[test]
-    fn test_full_failback_target_reset_rejects_foreign_snapshots() {
-        let script = build_full_failback_target_reset_script(
-            &sample_job(GuestType::Qemu),
-            &sample_failover_record(),
-            &sample_parsed_qemu_config(),
-        )
-        .expect("target reset script should build");
+    fn test_repair_classifier_rolls_back_job_owned_target_tail() {
+        let source = vec![
+            snapshot("tank/vmdata/vm-100-disk-0@rep_job-100_001", "guid-1", &[]),
+            snapshot("tank/vmdata/vm-100-disk-0@rep_job-100_002", "guid-2", &[]),
+        ];
+        let target = vec![
+            snapshot(
+                "tank/offsite/tank__vmdata__vm-100-disk-0@rep_job-100_001",
+                "guid-1",
+                &[],
+            ),
+            snapshot(
+                "tank/offsite/tank__vmdata__vm-100-disk-0@rep_job-100_002",
+                "guid-2",
+                &[],
+            ),
+            snapshot(
+                "tank/offsite/tank__vmdata__vm-100-disk-0@rep_job-100_003",
+                "guid-3",
+                &[],
+            ),
+        ];
 
-        assert!(script.contains("snapshots outside job"));
-        assert!(script.contains("@rep_job-100_"));
-        assert!(script.contains("zfs destroy -r"));
-        assert!(!script.contains("zfs destroy -R"));
+        let plan = classify_target_repair_tail("job-100", &source, &target);
+
+        assert_eq!(plan.mode, OffsiteFailbackRepairMode::RollbackTail);
+        assert_eq!(
+            plan.common_snapshot.as_deref(),
+            Some("tank/offsite/tank__vmdata__vm-100-disk-0@rep_job-100_002")
+        );
+        assert_eq!(
+            plan.target_tail_snapshots,
+            vec!["tank/offsite/tank__vmdata__vm-100-disk-0@rep_job-100_003".to_string()]
+        );
+        assert!(plan.retry_supported);
+    }
+
+    #[test]
+    fn test_repair_classifier_requires_full_reseed_without_common_guid() {
+        let source = vec![snapshot(
+            "tank/vmdata/vm-100-disk-0@rep_job-100_001",
+            "guid-1",
+            &[],
+        )];
+        let target = vec![snapshot(
+            "tank/offsite/tank__vmdata__vm-100-disk-0@rep_job-100_009",
+            "guid-9",
+            &[],
+        )];
+
+        let plan = classify_target_repair_tail("job-100", &source, &target);
+
+        assert_eq!(plan.mode, OffsiteFailbackRepairMode::FullReseed);
+        assert!(plan.common_snapshot.is_none());
+        assert!(!plan.retry_supported);
+    }
+
+    #[test]
+    fn test_repair_script_only_removes_explicit_job_owned_tail() {
+        let plan = ProtectionRepairPlan {
+            mode: OffsiteFailbackRepairMode::RollbackTail,
+            common_snapshot: Some(
+                "tank/offsite/tank__vmdata__vm-100-disk-0@rep_job-100_002".to_string(),
+            ),
+            common_guid: Some("guid-2".to_string()),
+            rollback_snapshots: vec![
+                "tank/offsite/tank__vmdata__vm-100-disk-0@rep_job-100_003".to_string(),
+                "tank/offsite/tank__vmdata__vm-100-disk-0@rep_job-100_004".to_string(),
+            ],
+            target_tail_snapshots: vec![
+                "tank/offsite/tank__vmdata__vm-100-disk-0@rep_job-100_003".to_string(),
+                "tank/offsite/tank__vmdata__vm-100-disk-0@rep_job-100_004".to_string(),
+            ],
+            reset_datasets: Vec::new(),
+            retry_supported: true,
+            message: "rollback tail".to_string(),
+        };
+
+        let script = build_target_repair_script(&plan);
+
+        let newest = script
+            .find("@rep_job-100_004")
+            .expect("newest divergent snapshot is removed");
+        let older = script
+            .find("@rep_job-100_003")
+            .expect("older divergent snapshot is removed");
+        assert!(newest < older);
+        assert!(!script.contains("@rep_job-100_002"));
+        assert!(!script.contains("zfs destroy -r"));
+    }
+
+    #[test]
+    fn test_can_reset_target_dataset_requires_positive_job_ownership() {
+        assert!(!can_reset_target_dataset_for_reseed(
+            "job-100",
+            "tank/offsite/tank__vmdata__vm-100-disk-0",
+            true,
+            &[],
+        ));
+        assert!(!can_reset_target_dataset_for_reseed(
+            "job-100",
+            "tank/offsite/tank__vmdata__vm-100-disk-0",
+            false,
+            &[snapshot(
+                "tank/offsite/tank__vmdata__vm-100-disk-0@rep_job-100_001",
+                "guid-1",
+                &[],
+            )],
+        ));
+        assert!(can_reset_target_dataset_for_reseed(
+            "job-100",
+            "tank/offsite/tank__vmdata__vm-100-disk-0",
+            true,
+            &[snapshot(
+                "tank/offsite/tank__vmdata__vm-100-disk-0@rep_job-100_001",
+                "guid-1",
+                &[],
+            )],
+        ));
+    }
+
+    #[test]
+    fn test_mixed_repair_plan_keeps_rollback_and_full_reseed_actions() {
+        let mixed = combine_repair_plans(vec![
+            (
+                "tank/offsite/disk-0".to_string(),
+                ProtectionRepairPlan {
+                    mode: OffsiteFailbackRepairMode::RollbackTail,
+                    common_snapshot: Some("tank/offsite/disk-0@rep_job-100_002".to_string()),
+                    common_guid: Some("guid-2".to_string()),
+                    rollback_snapshots: vec![
+                        "tank/offsite/disk-0@rep_job-100_003".to_string(),
+                        "tank/offsite/disk-0@rep_job-100_004".to_string(),
+                    ],
+                    target_tail_snapshots: vec![
+                        "tank/offsite/disk-0@rep_job-100_003".to_string(),
+                        "tank/offsite/disk-0@rep_job-100_004".to_string(),
+                    ],
+                    reset_datasets: Vec::new(),
+                    retry_supported: true,
+                    message: "rollback tail".to_string(),
+                },
+            ),
+            (
+                "tank/offsite/disk-1".to_string(),
+                ProtectionRepairPlan {
+                    mode: OffsiteFailbackRepairMode::FullReseed,
+                    common_snapshot: None,
+                    common_guid: None,
+                    rollback_snapshots: Vec::new(),
+                    target_tail_snapshots: vec!["tank/offsite/disk-1@foreign".to_string()],
+                    reset_datasets: vec!["tank/offsite/disk-1".to_string()],
+                    retry_supported: true,
+                    message: "full reseed".to_string(),
+                },
+            ),
+        ]);
+
+        assert_eq!(mixed.mode, OffsiteFailbackRepairMode::FullReseed);
+        assert_eq!(
+            mixed.rollback_snapshots,
+            vec![
+                "tank/offsite/disk-0@rep_job-100_003".to_string(),
+                "tank/offsite/disk-0@rep_job-100_004".to_string(),
+            ]
+        );
+        assert_eq!(
+            mixed.reset_datasets,
+            vec!["tank/offsite/disk-1".to_string()]
+        );
+
+        let script = build_target_repair_script(&mixed);
+        assert!(script.contains("zfs destroy 'tank/offsite/disk-0@rep_job-100_004'"));
+        assert!(script.contains("zfs destroy 'tank/offsite/disk-0@rep_job-100_003'"));
+        assert!(script.contains("zfs destroy -r 'tank/offsite/disk-1'"));
+    }
+
+    #[test]
+    fn test_retained_target_repair_reason_mentions_job_owned_replicas() {
+        let plan = ProtectionRepairPlan {
+            mode: OffsiteFailbackRepairMode::IncrementalResume,
+            common_snapshot: Some("tank/offsite/disk-0@rep_job-100_002".to_string()),
+            common_guid: Some("guid-2".to_string()),
+            rollback_snapshots: Vec::new(),
+            target_tail_snapshots: Vec::new(),
+            reset_datasets: Vec::new(),
+            retry_supported: true,
+            message: "target already matches source".to_string(),
+        };
+
+        let reason = format!(
+            "failback completed, but {}; {}",
+            retained_target_repair_reason(500),
+            protection_repair_reason(&plan)
+        );
+
+        assert!(reason.contains("job-owned target replica datasets"));
+        assert!(reason.contains("promoted VMID 500"));
+    }
+
+    #[test]
+    fn test_exact_target_dataset_from_origin_rejects_out_of_tree_origins() {
+        assert_eq!(
+            exact_target_dataset_from_origin(
+                "tank/offsite/tank__vmdata__vm-100-disk-0@rep_job-100_002",
+                "tank/offsite"
+            ),
+            Some("tank/offsite/tank__vmdata__vm-100-disk-0".to_string())
+        );
+        assert_eq!(
+            exact_target_dataset_from_origin(
+                "tank/other/tank__vmdata__vm-100-disk-0@rep_job-100_002",
+                "tank/offsite"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_build_source_target_repair_plan_uses_exact_duplicate_bindings() {
+        let bindings = vec![
+            RepairDatasetBinding {
+                disk_key: "scsi0".to_string(),
+                source_dataset: "tank/a/vm-100-disk-0".to_string(),
+                target_dataset: "tank/offsite/tank__a__vm-100-disk-0".to_string(),
+            },
+            RepairDatasetBinding {
+                disk_key: "scsi1".to_string(),
+                source_dataset: "tank/b/vm-100-disk-0".to_string(),
+                target_dataset: "tank/offsite/tank__b__vm-100-disk-0".to_string(),
+            },
+        ];
+        let source_inventory = HashMap::from([
+            (
+                "tank/a/vm-100-disk-0".to_string(),
+                vec![
+                    snapshot("tank/a/vm-100-disk-0@rep_job-100_001", "guid-a1", &[]),
+                    snapshot("tank/a/vm-100-disk-0@rep_job-100_002", "guid-a2", &[]),
+                ],
+            ),
+            (
+                "tank/b/vm-100-disk-0".to_string(),
+                vec![snapshot(
+                    "tank/b/vm-100-disk-0@rep_job-100_001",
+                    "guid-b1",
+                    &[],
+                )],
+            ),
+        ]);
+        let target_inventory = HashMap::from([
+            (
+                "tank/offsite/tank__a__vm-100-disk-0".to_string(),
+                vec![
+                    snapshot(
+                        "tank/offsite/tank__a__vm-100-disk-0@rep_job-100_001",
+                        "guid-a1",
+                        &[],
+                    ),
+                    snapshot(
+                        "tank/offsite/tank__a__vm-100-disk-0@rep_job-100_002",
+                        "guid-a2",
+                        &[],
+                    ),
+                    snapshot(
+                        "tank/offsite/tank__a__vm-100-disk-0@rep_job-100_003",
+                        "guid-a3",
+                        &[],
+                    ),
+                ],
+            ),
+            (
+                "tank/offsite/tank__b__vm-100-disk-0".to_string(),
+                vec![snapshot(
+                    "tank/offsite/tank__b__vm-100-disk-0@rep_job-100_001",
+                    "guid-b1",
+                    &[],
+                )],
+            ),
+        ]);
+
+        let plan = build_source_target_repair_plan(
+            "job-100",
+            &bindings,
+            &source_inventory,
+            &target_inventory,
+        );
+
+        assert_eq!(plan.mode, OffsiteFailbackRepairMode::RollbackTail);
+        assert_eq!(
+            plan.rollback_snapshots,
+            vec!["tank/offsite/tank__a__vm-100-disk-0@rep_job-100_003".to_string()]
+        );
+        assert!(!plan
+            .rollback_snapshots
+            .iter()
+            .any(|snapshot| snapshot.contains("tank__b__vm-100-disk-0@rep_job-100_003")));
+    }
+
+    #[test]
+    fn test_validate_failback_execution_precheck_rejects_wrong_source_vmid() {
+        let job = sample_job(GuestType::Qemu);
+        let request = OffsiteFailbackRequest {
+            recovery_vmid: 500,
+            restore_vmid: 101,
+            recovered_name: None,
+            start_guest: false,
+            allow_full: true,
+            force: true,
+            cleanup_target: false,
+        };
+        let precheck = OffsiteFailbackPrecheck {
+            incremental: true,
+            common_snapshot: None,
+            full_required: false,
+            repair_mode: OffsiteFailbackRepairMode::IncrementalResume,
+            repair_snapshot: None,
+            repair_snapshot_guid: None,
+            repair_target_snapshots: Vec::new(),
+            repair_requires_full_reseed: false,
+            source_guest_exists: false,
+            source_guest_running: false,
+            recovery_guest_running: false,
+            message: "incremental failback is available".to_string(),
+        };
+
+        let err = validate_failback_execution_precheck(&job, &request, &precheck)
+            .expect_err("failback with a mismatched source VMID must be rejected");
+        assert!(err.to_string().contains(
+            "failback requires restore VMID 101 to match replication job 'job-100' source VMID 100"
+        ));
+    }
+
+    #[test]
+    fn test_validate_failback_execution_precheck_requires_full_reseed_authorization() {
+        let job = sample_job(GuestType::Qemu);
+        let request = OffsiteFailbackRequest {
+            recovery_vmid: 500,
+            restore_vmid: 100,
+            recovered_name: None,
+            start_guest: false,
+            allow_full: false,
+            force: true,
+            cleanup_target: false,
+        };
+        let precheck = OffsiteFailbackPrecheck {
+            incremental: true,
+            common_snapshot: None,
+            full_required: false,
+            repair_mode: OffsiteFailbackRepairMode::FullReseed,
+            repair_snapshot: None,
+            repair_snapshot_guid: None,
+            repair_target_snapshots: Vec::new(),
+            repair_requires_full_reseed: true,
+            source_guest_exists: false,
+            source_guest_running: false,
+            recovery_guest_running: false,
+            message:
+                "full failback is available, but post-failback protection still requires an explicit full reseed"
+                    .to_string(),
+        };
+
+        let err = validate_failback_execution_precheck(&job, &request, &precheck)
+            .expect_err("full post-failback reseed must be authorized before source mutation");
+        assert_eq!(err.to_string(), precheck.message);
     }
 
     #[test]
@@ -4676,6 +5853,51 @@ mod tests {
         assert!(
             script.contains("resolve_recovery_snapshot 'vm-100-disk-0' 2 ''"),
             "second duplicate disk should resolve second matching snapshot"
+        );
+    }
+
+    #[test]
+    fn test_source_dataset_for_duplicate_basenames_requires_recorded_identity() {
+        let record = sample_failover_record();
+        let parsed = parse_qemu_config(
+            concat!(
+                "scsi0: lab-zfs:vm-100-disk-0,size=4G\n",
+                "scsi1: encpool:vm-100-disk-0,size=1G\n",
+            ),
+            100,
+        )
+        .expect("config should parse");
+
+        let err = source_dataset_for_disk(
+            &record,
+            &parsed,
+            &RecoveryGuestMetadata::default(),
+            &parsed.disks[1],
+        )
+        .expect_err("legacy duplicate basenames must be rejected without recorded metadata");
+        assert!(err
+            .to_string()
+            .contains("missing the exact per-disk source dataset identity"));
+
+        let metadata = RecoveryGuestMetadata {
+            source_disks: vec![
+                RecoveryGuestSourceDisk {
+                    disk_key: "scsi0".to_string(),
+                    source_dataset: "tank/fast/vm-100-disk-0".to_string(),
+                },
+                RecoveryGuestSourceDisk {
+                    disk_key: "scsi1".to_string(),
+                    source_dataset: "tank/slow/vm-100-disk-0".to_string(),
+                },
+            ],
+        };
+        assert_eq!(
+            source_dataset_for_disk(&record, &parsed, &metadata, &parsed.disks[0]).unwrap(),
+            "tank/fast/vm-100-disk-0"
+        );
+        assert_eq!(
+            source_dataset_for_disk(&record, &parsed, &metadata, &parsed.disks[1]).unwrap(),
+            "tank/slow/vm-100-disk-0"
         );
     }
 }
