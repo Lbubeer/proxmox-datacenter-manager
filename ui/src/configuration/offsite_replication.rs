@@ -4007,7 +4007,7 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                                                     </div>
                                                 } } else { html! {} }}
                                                 <div class="pdm-recovery-scroll-table">
-                                                    {DataTable::new(self.recovery_columns.clone(), self.recovery_view_store.clone()).class(pwt::css::FlexFit).selection(self.recovery_selection.clone())}
+                                                    {VNode::from(DataTable::new(self.recovery_columns.clone(), self.recovery_view_store.clone()).class(pwt::css::FlexFit).selection(self.recovery_selection.clone()))}
                                                 </div>
                                             </div>
                                         },
@@ -4032,7 +4032,7 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                                 )
                                 .with_optional_child(self.promotion_history_expanded.then(|| html! {
                                     <div class="pdm-recovery-scroll-table">
-                                        {DataTable::new(self.failover_record_columns.clone(), self.failover_record_store.clone()).class(pwt::css::FlexFit).selection(self.failover_record_selection.clone())}
+                                        {VNode::from(DataTable::new(self.failover_record_columns.clone(), self.failover_record_store.clone()).class(pwt::css::FlexFit).selection(self.failover_record_selection.clone()))}
                                     </div>
                                 })),
                         )
