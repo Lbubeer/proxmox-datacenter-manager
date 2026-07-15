@@ -12,6 +12,7 @@ use yew::{
     virtual_dom::{Key, VComp, VNode},
 };
 
+use pwt::css::ColorScheme;
 use pwt::prelude::*;
 use pwt::props::ExtractPrimaryKey;
 use pwt::state::{Selection, Store};
@@ -884,7 +885,10 @@ impl OffsiteReplicationPanelComp {
         self.guest_placement_loading = true;
         let link = ctx.link().clone();
         ctx.link().spawn(async move {
-            let resources = crate::pdm_client().resources(None, None).await;
+            let resources = crate::pdm_client()
+                .resources(None, None)
+                .await
+                .map_err(Error::from);
             link.send_message(Msg::GuestPlacementLoaded(id, resources));
         });
     }
@@ -898,7 +902,12 @@ impl OffsiteReplicationPanelComp {
         let link = ctx.link().clone();
         ctx.link().spawn(async move {
             let records_id = id.clone();
-            let resources_future = crate::pdm_client().resources(None, None);
+            let resources_future = async {
+                crate::pdm_client()
+                    .resources(None, None)
+                    .await
+                    .map_err(Error::from)
+            };
             let records_future = async move {
                 let path = format!(
                     "{BASE_URL}/{}/failover-records",
