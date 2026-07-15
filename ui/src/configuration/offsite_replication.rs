@@ -168,7 +168,6 @@ pub enum Msg {
     UpdateFailoverName(String),
     UpdateFailoverStart(bool),
     UpdateFailbackReplaceSource(bool),
-    UpdateFailbackRestoreVmid(String),
     UpdateFailbackAllowFull(bool),
     UpdateFailbackCleanupTarget(bool),
     UpdateFailbackStart(bool),
@@ -2657,14 +2656,6 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
             Msg::UpdateFailbackReplaceSource(value) => {
                 self.failback_replace_source_guest = value;
             }
-            Msg::UpdateFailbackRestoreVmid(value) => {
-                if let Some(job) = self.selected_failover_job() {
-                    self.failback_restore_vmid_input = job.job.vmid.to_string();
-                } else if !value.trim().is_empty() {
-                    self.failback_restore_vmid_input = value;
-                }
-                self.clear_failback_precheck();
-            }
             Msg::UpdateFailbackAllowFull(value) => {
                 self.failback_allow_full = value;
             }
@@ -3963,7 +3954,6 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                                                     || self.failover_records_loading,
                                             )
                                                 .on_activate({
-                                                    let id = id.clone();
                                                     let link = ctx.link().clone();
                                                     move |_| link.send_message(Msg::GuestPlacementRefreshTick)
                                                 }),
