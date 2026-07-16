@@ -402,6 +402,9 @@ pub struct OffsiteRecoveryOperationStatus {
     /// Whether byte-level telemetry is available for the current transfer.
     #[serde(default)]
     pub telemetry_available: bool,
+    /// Whether an operator has acknowledged a terminal failure.
+    #[serde(default)]
+    pub acknowledged: bool,
     /// Terminal error or reconciliation warning.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,

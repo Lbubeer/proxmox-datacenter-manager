@@ -172,6 +172,8 @@ pub enum Msg {
         u64,
         Result<Option<OffsiteRecoveryOperationStatus>, Error>,
     ),
+    AcknowledgeRecoveryFailure,
+    AcknowledgeRecoveryFailureFinished(Result<(), Error>),
     GuestPlacementRefreshTick,
     RequestFailover(bool),
     TriggerFailover(String, OffsiteFailoverRequest),
@@ -433,6 +435,7 @@ pub struct OffsiteReplicationPanelComp {
     guest_config_summaries: HashMap<String, RecoveryGuestConfigState>,
     guest_placement_timer: Option<Timeout>,
     recovery_operation: Option<OffsiteRecoveryOperationStatus>,
+    recovery_failure_acknowledging: bool,
     recovery_filter_text: String,
     recovery_filter_mode: String,
     recovery_filter_recoverable: String,
@@ -2188,6 +2191,7 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
             guest_config_summaries: HashMap::new(),
             guest_placement_timer: None,
             recovery_operation: None,
+            recovery_failure_acknowledging: false,
             recovery_filter_text: String::new(),
             recovery_filter_mode: "all".to_string(),
             recovery_filter_recoverable: "all".to_string(),
@@ -2978,6 +2982,44 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                     self.refresh_guest_placement(id, ctx);
                 } else {
                     self.schedule_guest_placement_refresh(ctx);
+                }
+            }
+            Msg::AcknowledgeRecoveryFailure => {
+                let Some(id) = self.failover_job_id.clone() else {
+                    return false;
+                };
+                if !self
+                    .recovery_operation
+                    .as_ref()
+                    .is_some_and(recovery_operation_failure_visible)
+                {
+                    return false;
+                }
+                self.recovery_failure_acknowledging = true;
+                let link = ctx.link().clone();
+                ctx.link().spawn(async move {
+                    let path = format!(
+                        "{BASE_URL}/{}/recovery-operation",
+                        percent_encode_component(&id)
+                    );
+                    let result = http_post(&path, None).await;
+                    link.send_message(Msg::AcknowledgeRecoveryFailureFinished(result));
+                });
+            }
+            Msg::AcknowledgeRecoveryFailureFinished(result) => {
+                self.recovery_failure_acknowledging = false;
+                match result {
+                    Ok(()) => {
+                        if let Some(operation) = self.recovery_operation.as_mut() {
+                            operation.acknowledged = true;
+                        }
+                        self.cache_current_recovery_state();
+                    }
+                    Err(err) => ctx.link().show_error(
+                        tr!("Dismiss recovery failure"),
+                        err.to_string(),
+                        true,
+                    ),
                 }
             }
             Msg::GuestPlacementRefreshTick => {
@@ -4100,20 +4142,6 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                         format!("{}. {}", operation.phase, tr!("Keep both guests isolated until source placement has reconciled.")),
                     ),
                 }
-            } else if self
-                .recovery_operation
-                .as_ref()
-                .is_some_and(|operation| operation.state == OffsiteRecoveryOperationState::Failed)
-            {
-                (
-                    tr!("Recovery Action Failed"),
-                    "times-circle",
-                    ColorScheme::Error,
-                    self.recovery_operation
-                        .as_ref()
-                        .and_then(|operation| operation.message.clone())
-                        .unwrap_or_else(|| tr!("Open the task details, correct the failure, and refresh live state before retrying.")),
-                )
             } else if has_active_promotion && failback_execution_ready {
                 (
                     tr!("Ready for Failback"),
@@ -4435,82 +4463,140 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                 })
                 .into();
             let operation_activity = self.recovery_operation.as_ref().and_then(|operation| {
-                (operation.state.is_active()
-                    || operation.state == OffsiteRecoveryOperationState::Failed)
-                    .then(|| {
-                        let elapsed = proxmox_time::epoch_i64()
-                            .saturating_sub(operation.start_time)
-                            .max(0);
-                        let progress = match (
-                            operation.transferred_bytes,
-                            operation.estimated_bytes,
-                        ) {
-                            (Some(done), Some(total)) if total > 0 => {
-                                let percent = ((done as f64 / total as f64) * 100.0).min(100.0);
-                                Some((done, total, percent))
-                            }
-                            _ => None,
-                        };
-                        let transfer_summary = progress.map(|(done, total, percent)| {
-                            let mut summary = format!(
-                                "{} / ~{} ({percent:.1}%)",
-                                HumanByte::from(done),
-                                HumanByte::from(total)
-                            );
-                            if let Some(rate) = operation.bytes_per_second {
-                                summary.push_str(&format!(" · {}/s", HumanByte::from(rate)));
-                            }
-                            if let Some(eta) = operation.eta_seconds {
-                                summary.push_str(&format!(
-                                    " · {} {}",
-                                    format_duration_human(eta as f64),
-                                    tr!("remaining")
-                                ));
-                            }
-                            summary
-                        });
-                        let task_button: Html = operation
-                            .upid
-                            .as_ref()
-                            .map(|upid| {
-                                let upid = upid.clone();
-                                let link = ctx.link().clone();
-                                Button::new(tr!("Task Details"))
-                                    .icon_class("fa fa-list")
-                                    .on_activate(move |_| link.show_task_log(upid.clone(), None))
-                            })
-                            .map(Into::into)
-                            .unwrap_or_default();
-                        html! {
-                            <section class={classes!(
-                                "pdm-recovery-activity",
-                                (operation.state == OffsiteRecoveryOperationState::Failed)
-                                    .then_some("pdm-recovery-activity-error"),
-                            )}>
-                                <div class="pdm-recovery-activity-heading">
-                                    <div>
-                                        <strong>{operation.phase.clone()}</strong>
-                                        <span>{format!("{} · {}", recovery_operation_state_text(operation.state), format_duration_human(elapsed as f64))}</span>
-                                    </div>
-                                    {task_button}
-                                </div>
-                                {progress.map(|(_, _, percent)| html! {
-                                    <div class="pdm-recovery-progress" aria-label={format!("{percent:.1}%") }>
-                                        <span style={format!("width:{percent:.2}%")}></span>
-                                    </div>
-                                }).unwrap_or_default()}
-                                {transfer_summary.map(|summary| html! {
-                                    <div class="pdm-recovery-transfer-summary">{summary}</div>
-                                }).unwrap_or_default()}
-                                {operation.disk_index.zip(operation.disk_count).map(|(index, count)| html! {
-                                    <div class="pdm-recovery-transfer-summary">{format!("{} {index} / {count}", tr!("Disk"))}</div>
-                                }).unwrap_or_default()}
-                                {operation.message.as_ref().map(|message| html! {
-                                    <div class="pdm-recovery-operation-message">{message}</div>
-                                }).unwrap_or_default()}
-                            </section>
+                let now = proxmox_time::epoch_i64();
+                let task_button = || -> Html {
+                    operation
+                        .upid
+                        .as_ref()
+                        .map(|upid| {
+                            let upid = upid.clone();
+                            let link = ctx.link().clone();
+                            Button::new(tr!("Task Details"))
+                                .icon_class("fa fa-list")
+                                .on_activate(move |_| link.show_task_log(upid.clone(), None))
+                        })
+                        .map(Into::into)
+                        .unwrap_or_default()
+                };
+
+                if operation.state.is_active() {
+                    let elapsed = recovery_operation_duration(operation, now);
+                    let progress = match (
+                        operation.transferred_bytes,
+                        operation.estimated_bytes,
+                    ) {
+                        (Some(done), Some(total)) if total > 0 => {
+                            let percent = ((done as f64 / total as f64) * 100.0).min(100.0);
+                            Some((done, total, percent))
                         }
+                        _ => None,
+                    };
+                    let transfer_summary = progress.map(|(done, total, percent)| {
+                        let mut summary = format!(
+                            "{} / ~{} ({percent:.1}%)",
+                            HumanByte::from(done),
+                            HumanByte::from(total)
+                        );
+                        if let Some(rate) = operation.bytes_per_second {
+                            summary.push_str(&format!(" · {}/s", HumanByte::from(rate)));
+                        }
+                        if let Some(eta) = operation.eta_seconds {
+                            summary.push_str(&format!(
+                                " · {} {}",
+                                format_duration_human(eta as f64),
+                                tr!("remaining")
+                            ));
+                        }
+                        summary
+                    });
+                    return Some(html! {
+                        <section class="pdm-recovery-activity">
+                            <div class="pdm-recovery-activity-heading">
+                                <div>
+                                    <strong>{operation.phase.clone()}</strong>
+                                    <span>{format!("{} · {}", recovery_operation_state_text(operation.state), format_duration_human(elapsed as f64))}</span>
+                                </div>
+                                {task_button()}
+                            </div>
+                            {progress.map(|(_, _, percent)| html! {
+                                <div class="pdm-recovery-progress" aria-label={format!("{percent:.1}%") }>
+                                    <span style={format!("width:{percent:.2}%")}></span>
+                                </div>
+                            }).unwrap_or_default()}
+                            {transfer_summary.map(|summary| html! {
+                                <div class="pdm-recovery-transfer-summary">{summary}</div>
+                            }).unwrap_or_default()}
+                            {operation.disk_index.zip(operation.disk_count).map(|(index, count)| html! {
+                                <div class="pdm-recovery-transfer-summary">{format!("{} {index} / {count}", tr!("Disk"))}</div>
+                            }).unwrap_or_default()}
+                        </section>
+                    });
+                }
+
+                if !recovery_operation_failure_visible(operation) {
+                    return None;
+                }
+
+                let duration = recovery_operation_duration(operation, now);
+                let completed_at = operation.end_time.unwrap_or(operation.updated_time);
+                let title = match operation.kind {
+                    OffsiteRecoveryOperationKind::Promote => tr!("Last promotion failed"),
+                    OffsiteRecoveryOperationKind::Failback => tr!("Last failback failed"),
+                };
+                let mut transfer_details = Vec::new();
+                if let Some(done) = operation.transferred_bytes {
+                    transfer_details.push(format!(
+                        "{} {}",
+                        HumanByte::from(done),
+                        tr!("transferred before failure")
+                    ));
+                }
+                if let Some((index, count)) = operation.disk_index.zip(operation.disk_count) {
+                    transfer_details.push(format!("{} {index} / {count}", tr!("Disk")));
+                }
+                let retry_button: Html = (operation.kind == OffsiteRecoveryOperationKind::Failback
+                    && has_active_promotion)
+                    .then(|| {
+                        Button::new(tr!("Run Failback Precheck"))
+                            .icon_class("fa fa-search")
+                            .disabled(
+                                !failback_ready_ok
+                                    || self.failback_running
+                                    || self.failover_records_loading
+                                    || self.guest_placement_loading,
+                            )
+                            .on_activate(ctx.link().callback(|_| Msg::FailbackPrecheck))
                     })
+                    .map(Into::into)
+                    .unwrap_or_default();
+                let dismiss_button: Html = Button::new(tr!("Dismiss"))
+                    .icon_class("fa fa-times")
+                    .disabled(self.recovery_failure_acknowledging)
+                    .on_activate(ctx.link().callback(|_| Msg::AcknowledgeRecoveryFailure))
+                    .into();
+
+                Some(html! {
+                    <section class="pdm-recovery-failure" role="alert">
+                        <div class="pdm-recovery-failure-heading">
+                            {Fa::new("times-circle")}
+                            <div>
+                                <strong>{title}</strong>
+                                <span>{format!("{} · {} {} · {}", render_epoch_short(completed_at), tr!("after"), format_duration_human(duration as f64), recovery_operation_state_text(operation.state))}</span>
+                            </div>
+                        </div>
+                        {operation.message.as_ref().map(|message| html! {
+                            <div class="pdm-recovery-operation-message">{message}</div>
+                        }).unwrap_or_default()}
+                        {(!transfer_details.is_empty()).then(|| html! {
+                            <div class="pdm-recovery-transfer-summary">{transfer_details.join(" · ")}</div>
+                        }).unwrap_or_default()}
+                        <div class="pdm-recovery-failure-actions">
+                            {retry_button}
+                            {task_button()}
+                            {dismiss_button}
+                        </div>
+                    </section>
+                })
             });
             let selected_protection_point = self
                 .recovery_points
@@ -6177,6 +6263,19 @@ fn recovery_operation_state_text(state: OffsiteRecoveryOperationState) -> String
     }
 }
 
+fn recovery_operation_failure_visible(operation: &OffsiteRecoveryOperationStatus) -> bool {
+    operation.state == OffsiteRecoveryOperationState::Failed && !operation.acknowledged
+}
+
+fn recovery_operation_duration(operation: &OffsiteRecoveryOperationStatus, now: i64) -> i64 {
+    let end = if operation.state.is_active() {
+        now
+    } else {
+        operation.end_time.unwrap_or(operation.updated_time)
+    };
+    end.saturating_sub(operation.start_time).max(0)
+}
+
 fn status_text(item: &OffsiteReplicationJobStatus) -> String {
     if item.status.running {
         return tr!("Running");
@@ -6879,6 +6978,31 @@ fn render_result_trend_graph(
 #[cfg(test)]
 mod recovery_guest_metric_tests {
     use super::*;
+
+    #[test]
+    fn terminal_recovery_duration_stops_at_end_time() {
+        let operation = OffsiteRecoveryOperationStatus {
+            state: OffsiteRecoveryOperationState::Failed,
+            start_time: 100,
+            updated_time: 112,
+            end_time: Some(113),
+            ..Default::default()
+        };
+
+        assert_eq!(recovery_operation_duration(&operation, 10_000), 13);
+    }
+
+    #[test]
+    fn acknowledged_recovery_failure_is_hidden() {
+        let mut operation = OffsiteRecoveryOperationStatus {
+            state: OffsiteRecoveryOperationState::Failed,
+            ..Default::default()
+        };
+        assert!(recovery_operation_failure_visible(&operation));
+
+        operation.acknowledged = true;
+        assert!(!recovery_operation_failure_visible(&operation));
+    }
 
     #[test]
     fn parses_configured_disk_sizes() {

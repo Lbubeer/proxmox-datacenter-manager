@@ -188,6 +188,12 @@ fn recovery_operation_path(job_id: &str) -> std::path::PathBuf {
     path
 }
 
+fn recovery_operation_lock_path(job_id: &str) -> std::path::PathBuf {
+    let mut path = std::path::PathBuf::from(RECOVERY_OPERATION_DIR);
+    path.push(format!("{}.lck", sanitize_id(job_id)));
+    path
+}
+
 fn ensure_history_dir() -> Result<(), Error> {
     let mode = nix::sys::stat::Mode::from_bits_truncate(0o0750);
     let opts = proxmox_product_config::default_create_options().perm(mode);
@@ -230,11 +236,28 @@ fn ensure_recovery_operation_dir() -> Result<(), Error> {
     Ok(())
 }
 
-fn save_recovery_operation(
+fn lock_recovery_operation(
+    job_id: &str,
+) -> Result<proxmox_product_config::ApiLockGuard, Error> {
+    ensure_recovery_operation_dir()?;
+    proxmox_product_config::open_api_lockfile(recovery_operation_lock_path(job_id), None, true)
+}
+
+fn read_recovery_operation_unlocked(
+    job_id: &str,
+) -> Result<Option<OffsiteRecoveryOperationStatus>, Error> {
+    let content = proxmox_sys::fs::file_read_optional_string(recovery_operation_path(job_id))?
+        .unwrap_or_default();
+    if content.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_str(&content)?))
+}
+
+fn save_recovery_operation_unlocked(
     job_id: &str,
     operation: &OffsiteRecoveryOperationStatus,
 ) -> Result<(), Error> {
-    ensure_recovery_operation_dir()?;
     let raw = serde_json::to_vec_pretty(operation)?;
     proxmox_sys::fs::replace_file(
         recovery_operation_path(job_id),
@@ -244,16 +267,21 @@ fn save_recovery_operation(
     )
 }
 
+fn save_recovery_operation(
+    job_id: &str,
+    operation: &OffsiteRecoveryOperationStatus,
+) -> Result<(), Error> {
+    let _lock = lock_recovery_operation(job_id)?;
+    save_recovery_operation_unlocked(job_id, operation)
+}
+
 pub fn recovery_operation_status(
     job_id: &str,
 ) -> Result<Option<OffsiteRecoveryOperationStatus>, Error> {
-    ensure_recovery_operation_dir()?;
-    let content = proxmox_sys::fs::file_read_optional_string(recovery_operation_path(job_id))?
-        .unwrap_or_default();
-    if content.trim().is_empty() {
+    let _lock = lock_recovery_operation(job_id)?;
+    let Some(mut operation) = read_recovery_operation_unlocked(job_id)? else {
         return Ok(None);
-    }
-    let mut operation: OffsiteRecoveryOperationStatus = serde_json::from_str(&content)?;
+    };
     if operation.state == OffsiteRecoveryOperationState::Submitting
         && operation.upid.is_none()
         && proxmox_time::epoch_i64().saturating_sub(operation.updated_time) > 60
@@ -262,7 +290,7 @@ pub fn recovery_operation_status(
         operation.phase = "Failed".to_string();
         operation.end_time = Some(proxmox_time::epoch_i64());
         operation.message = Some("recovery worker was not started".to_string());
-        save_recovery_operation(job_id, &operation)?;
+        save_recovery_operation_unlocked(job_id, &operation)?;
     }
     if operation.state.is_active() {
         if let Some(upid) = operation
@@ -287,7 +315,7 @@ pub fn recovery_operation_status(
                     operation.message = Some(other.to_string());
                 }
             }
-            save_recovery_operation(job_id, &operation)?;
+            save_recovery_operation_unlocked(job_id, &operation)?;
         }
     }
     Ok(Some(operation))
@@ -297,11 +325,12 @@ fn update_recovery_operation<F>(job_id: &str, update: F) -> Result<(), Error>
 where
     F: FnOnce(&mut OffsiteRecoveryOperationStatus),
 {
-    let mut operation = recovery_operation_status(job_id)?
+    let _lock = lock_recovery_operation(job_id)?;
+    let mut operation = read_recovery_operation_unlocked(job_id)?
         .with_context(|| format!("recovery operation state for job '{job_id}' is missing"))?;
     update(&mut operation);
     operation.updated_time = proxmox_time::epoch_i64();
-    save_recovery_operation(job_id, &operation)
+    save_recovery_operation_unlocked(job_id, &operation)
 }
 
 fn set_recovery_phase(job_id: &str, phase: &str) {
@@ -336,13 +365,30 @@ fn finish_recovery_operation(job_id: &str, success: bool, message: Option<String
 }
 
 pub fn acknowledge_recovery_operation(job_id: &str) -> Result<(), Error> {
-    update_recovery_operation(job_id, |operation| {
-        if operation.state == OffsiteRecoveryOperationState::Reconciling {
+    let _lock = lock_recovery_operation(job_id)?;
+    let mut operation = read_recovery_operation_unlocked(job_id)?
+        .with_context(|| format!("recovery operation state for job '{job_id}' is missing"))?;
+    acknowledge_recovery_operation_status(&mut operation)?;
+    operation.updated_time = proxmox_time::epoch_i64();
+    save_recovery_operation_unlocked(job_id, &operation)
+}
+
+fn acknowledge_recovery_operation_status(
+    operation: &mut OffsiteRecoveryOperationStatus,
+) -> Result<(), Error> {
+    match operation.state {
+        OffsiteRecoveryOperationState::Reconciling => {
             operation.state = OffsiteRecoveryOperationState::Succeeded;
             operation.phase = "Completed".to_string();
             operation.end_time = Some(proxmox_time::epoch_i64());
         }
-    })
+        OffsiteRecoveryOperationState::Failed => operation.acknowledged = true,
+        OffsiteRecoveryOperationState::Succeeded => {}
+        OffsiteRecoveryOperationState::Submitting | OffsiteRecoveryOperationState::Running => {
+            bail!("an active recovery operation cannot be acknowledged")
+        }
+    }
+    Ok(())
 }
 
 fn load_recovery_point_catalog(job_id: &str) -> Result<RecoveryPointCatalog, Error> {
@@ -2283,6 +2329,7 @@ fn remove_local_job_artifacts(job_id: &str) -> Result<(), Error> {
         lifecycle_state_path(job_id),
         failover_record_path(job_id),
         recovery_operation_path(job_id),
+        recovery_operation_lock_path(job_id),
     ] {
         if let Err(err) = std::fs::remove_file(&file) {
             if err.kind() != std::io::ErrorKind::NotFound {
@@ -5417,6 +5464,53 @@ mod tests {
             OffsiteFailoverLifecycle::Returned,
             false,
         ));
+    }
+
+    #[test]
+    fn test_failed_recovery_operation_can_be_acknowledged() {
+        let mut operation = OffsiteRecoveryOperationStatus {
+            state: OffsiteRecoveryOperationState::Failed,
+            ..Default::default()
+        };
+
+        acknowledge_recovery_operation_status(&mut operation)
+            .expect("terminal failure should be acknowledgeable");
+
+        assert_eq!(operation.state, OffsiteRecoveryOperationState::Failed);
+        assert!(operation.acknowledged);
+    }
+
+    #[test]
+    fn test_reconciling_recovery_operation_completes_on_acknowledge() {
+        let mut operation = OffsiteRecoveryOperationStatus {
+            state: OffsiteRecoveryOperationState::Reconciling,
+            ..Default::default()
+        };
+
+        acknowledge_recovery_operation_status(&mut operation)
+            .expect("reconciled operation should complete");
+
+        assert_eq!(operation.state, OffsiteRecoveryOperationState::Succeeded);
+        assert_eq!(operation.phase, "Completed");
+        assert!(operation.end_time.is_some());
+    }
+
+    #[test]
+    fn test_active_recovery_operation_cannot_be_acknowledged() {
+        for state in [
+            OffsiteRecoveryOperationState::Submitting,
+            OffsiteRecoveryOperationState::Running,
+        ] {
+            let mut operation = OffsiteRecoveryOperationStatus {
+                state,
+                ..Default::default()
+            };
+
+            let error = acknowledge_recovery_operation_status(&mut operation)
+                .expect_err("active operation acknowledgement must be rejected");
+
+            assert!(error.to_string().contains("active recovery operation"));
+        }
     }
 
     fn sample_job(guest_type: GuestType) -> OffsiteReplicationJob {

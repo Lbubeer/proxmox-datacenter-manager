@@ -550,7 +550,7 @@ fn read_recovery_operation(
         permission: &Permission::Privilege(&["resource"], PRIV_RESOURCE_MANAGE, true),
     },
 )]
-/// Mark a successfully reconciled recovery operation complete.
+/// Mark a successfully reconciled operation complete or acknowledge a terminal failure.
 fn acknowledge_recovery_operation(
     id: String,
     rpcenv: &mut dyn RpcEnvironment,
