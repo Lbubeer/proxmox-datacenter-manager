@@ -48,7 +48,7 @@ use pdm_api_types::{
 };
 
 use crate::get_deep_url;
-use crate::pve::utils::guest_status_label;
+use crate::pve::utils::{foreach_drive_qemu, guest_status_label};
 use crate::renderer::{render_status_icon, status_row};
 use crate::widget::{PveGuestSelector, PveNodeSelector, RemoteSelector};
 
@@ -160,6 +160,12 @@ pub enum Msg {
         Result<Vec<RemoteResources>, Error>,
         Result<Vec<OffsiteFailoverRecord>, Error>,
         Result<Option<OffsiteRecoveryOperationStatus>, Error>,
+    ),
+    GuestConfigLoaded(
+        String,
+        u64,
+        String,
+        Result<RecoveryGuestConfigSummary, Error>,
     ),
     RecoveryOperationRefreshed(
         String,
@@ -366,6 +372,19 @@ struct CachedRecoveryState {
     verified_at: Option<i64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RecoveryGuestConfigSummary {
+    disk_bytes: u64,
+    disk_count: usize,
+}
+
+#[derive(Clone, Debug)]
+enum RecoveryGuestConfigState {
+    Loading,
+    Ready(RecoveryGuestConfigSummary),
+    Unavailable,
+}
+
 pub struct OffsiteReplicationPanelComp {
     state: LoadableComponentState<ViewState>,
     store: Store<OffsiteReplicationJobStatus>,
@@ -411,6 +430,7 @@ pub struct OffsiteReplicationPanelComp {
     guest_placement_loading: bool,
     guest_placement_resources: Vec<RemoteResources>,
     guest_placement_store: Store<RecoveryGuestRow>,
+    guest_config_summaries: HashMap<String, RecoveryGuestConfigState>,
     guest_placement_timer: Option<Timeout>,
     recovery_operation: Option<OffsiteRecoveryOperationStatus>,
     recovery_filter_text: String,
@@ -465,6 +485,56 @@ pwt::impl_deref_mut_property!(
 );
 
 impl OffsiteReplicationPanelComp {
+    fn load_guest_config_summaries(&mut self, ctx: &LoadableComponentContext<Self>) {
+        let Some(job_id) = self.failover_job_id.clone() else {
+            return;
+        };
+        let generation = self.recovery_load_generation;
+        let guests = self
+            .guest_placement_store
+            .read()
+            .data()
+            .iter()
+            .map(|row| {
+                (
+                    guest_config_key(&row.remote, row.vmid),
+                    row.remote.clone(),
+                    row.node.clone(),
+                    row.vmid,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for (key, remote, node, vmid) in guests {
+            if self.guest_config_summaries.contains_key(&key) {
+                continue;
+            }
+            self.guest_config_summaries
+                .insert(key.clone(), RecoveryGuestConfigState::Loading);
+            let link = ctx.link().clone();
+            let response_job_id = job_id.clone();
+            ctx.link().spawn(async move {
+                let result = crate::pdm_client()
+                    .pve_qemu_config(
+                        &remote,
+                        Some(&node),
+                        vmid,
+                        pdm_api_types::ConfigurationState::Active,
+                        None,
+                    )
+                    .await
+                    .map_err(Error::from)
+                    .map(|config| summarize_qemu_config(&config));
+                link.send_message(Msg::GuestConfigLoaded(
+                    response_job_id,
+                    generation,
+                    key,
+                    result,
+                ));
+            });
+        }
+    }
+
     fn columns() -> Rc<Vec<DataTableHeader<OffsiteReplicationJobStatus>>> {
         Rc::new(vec![
             DataTableColumn::new(tr!("ID"))
@@ -1633,6 +1703,7 @@ impl OffsiteReplicationPanelComp {
                 self.failback_last_task = None;
                 self.recovery_operation = None;
                 self.guest_placement_store.set_data(Vec::new());
+                self.guest_config_summaries.clear();
                 self.recovery_points.clear();
                 self.recovery_store.set_data(Vec::new());
                 self.recovery_view_store.set_data(Vec::new());
@@ -1655,6 +1726,7 @@ impl OffsiteReplicationPanelComp {
                     self.failover_record_selection.select(preferred);
                 }
                 self.rebuild_guest_placement();
+                self.load_guest_config_summaries(ctx);
             }
             self.guest_placement_timer = None;
             self.recovery_bootstrap_state = if cached.is_some() {
@@ -2113,6 +2185,7 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
             guest_placement_loading: false,
             guest_placement_resources: Vec::new(),
             guest_placement_store: Store::new(),
+            guest_config_summaries: HashMap::new(),
             guest_placement_timer: None,
             recovery_operation: None,
             recovery_filter_text: String::new(),
@@ -2694,6 +2767,7 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                             self.clear_failback_precheck();
                         }
                         self.rebuild_guest_placement();
+                        self.load_guest_config_summaries(ctx);
                         self.recovery_bootstrap_state = RecoveryBootstrapState::Stored;
                         self.recovery_bootstrap_error = None;
                         self.cache_current_recovery_state();
@@ -2734,6 +2808,7 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                         self.recovery_verified_at = Some(proxmox_time::epoch_i64());
                         self.recovery_bootstrap_error = None;
                         self.rebuild_guest_placement();
+                        self.load_guest_config_summaries(ctx);
                         self.cache_current_recovery_state();
                     }
                     Err(err) => {
@@ -2765,6 +2840,7 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                     }
                 }
                 self.rebuild_guest_placement();
+                self.load_guest_config_summaries(ctx);
                 self.cache_current_recovery_state();
                 if previous != self.guest_placement_live_state() && !previous.is_empty() {
                     self.clear_failback_precheck();
@@ -2806,6 +2882,7 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                     self.recovery_operation = operation;
                 }
                 self.rebuild_guest_placement();
+                self.load_guest_config_summaries(ctx);
                 if let Some(operation) = self.recovery_operation.clone() {
                     let active = operation.state.is_active();
                     self.failover_running =
@@ -2860,6 +2937,21 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                 self.cache_current_recovery_state();
                 self.schedule_guest_placement_refresh(ctx);
             }
+            Msg::GuestConfigLoaded(id, generation, key, result) => {
+                if !self.recovery_request_is_current(&id, generation) {
+                    return false;
+                }
+                self.guest_config_summaries.insert(
+                    key,
+                    match result {
+                        Ok(summary) => RecoveryGuestConfigState::Ready(summary),
+                        Err(err) => {
+                            log::warn!("failed to load recovery guest configuration: {err}");
+                            RecoveryGuestConfigState::Unavailable
+                        }
+                    },
+                );
+            }
             Msg::RecoveryOperationRefreshed(id, generation, result) => {
                 if !self.recovery_request_is_current(&id, generation) {
                     return false;
@@ -2878,6 +2970,7 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                     self.failback_running = false;
                 }
                 self.rebuild_guest_placement();
+                self.load_guest_config_summaries(ctx);
                 self.cache_current_recovery_state();
                 if self.recovery_operation.as_ref().is_some_and(|operation| {
                     operation.state == OffsiteRecoveryOperationState::Reconciling
@@ -2932,6 +3025,7 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
 
                 self.recovery_load_generation = self.recovery_load_generation.wrapping_add(1);
                 self.failover_verification_loading = false;
+                self.guest_config_summaries.clear();
                 self.failover_running = true;
                 let link = ctx.link().clone();
                 ctx.link().spawn(async move {
@@ -3015,6 +3109,7 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
 
                 self.recovery_load_generation = self.recovery_load_generation.wrapping_add(1);
                 self.failover_verification_loading = false;
+                self.guest_config_summaries.clear();
                 self.failback_running = true;
                 let link = ctx.link().clone();
                 ctx.link().spawn(async move {
@@ -4358,7 +4453,7 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                         };
                         let transfer_summary = progress.map(|(done, total, percent)| {
                             let mut summary = format!(
-                                "{} / {} ({percent:.1}%)",
+                                "{} / ~{} ({percent:.1}%)",
                                 HumanByte::from(done),
                                 HumanByte::from(total)
                             );
@@ -4428,6 +4523,36 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                 .iter()
                 .cloned()
                 .map(|row| {
+                    let related_record = if row.key == "source" {
+                        self.failover_records.first()
+                    } else {
+                        self.failover_records
+                            .iter()
+                            .find(|record| record.recovery_vmid == row.vmid)
+                    };
+                    let active_promotion = self
+                        .failover_records
+                        .iter()
+                        .any(|record| record.lifecycle == OffsiteFailoverLifecycle::Active);
+                    let authoritative = if row.key == "source" {
+                        !active_promotion
+                    } else {
+                        related_record.is_some_and(|record| {
+                            record.lifecycle == OffsiteFailoverLifecycle::Active
+                        })
+                    };
+                    let retained_target = row.key != "source"
+                        && related_record.is_some_and(|record| {
+                            record.lifecycle == OffsiteFailoverLifecycle::Returned
+                                && !record.target_cleaned
+                        });
+                    let power_class = match row.resource.as_ref().map(|resource| resource.status()) {
+                        Some("running") => "pdm-recovery-power-running",
+                        Some("stopped") => "pdm-recovery-power-stopped",
+                        Some(_) => "pdm-recovery-power-warning",
+                        None if row.status == tr!("Missing") => "pdm-recovery-power-error",
+                        None => "pdm-recovery-power-warning",
+                    };
                     let status_icon: Html = if let Some(resource) = row.resource.as_ref() {
                         render_status_icon(resource).into()
                     } else if row.status == tr!("Missing") {
@@ -4454,6 +4579,9 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                         })
                         .map(Into::into)
                         .unwrap_or_default();
+                    let config_state = self
+                        .guest_config_summaries
+                        .get(&guest_config_key(&row.remote, row.vmid));
                     let guest_metrics = row
                         .resource
                         .as_ref()
@@ -4464,17 +4592,44 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                                 .as_ref()
                                 .is_some_and(|resource| resource.status() == "running");
                             let cpu_text = if running {
-                                format!("{:.1}% / {:.0} vCPU", cpu * 100.0, maxcpu)
+                                format!("{:.1}% of {:.0} vCPU", cpu * 100.0, maxcpu)
+                            } else if maxcpu > 0.0 {
+                                format!("{:.0} vCPU configured", maxcpu)
                             } else {
-                                format!("— / {:.0} vCPU", maxcpu)
+                                tr!("Configuration unavailable")
                             };
                             let memory_text = if running {
-                                format!("{} / {}", HumanByte::from(mem), HumanByte::from(maxmem))
+                                format!("{} of {}", HumanByte::from(mem), HumanByte::from(maxmem))
+                            } else if maxmem > 0 {
+                                format!("{} configured", HumanByte::from(maxmem))
                             } else {
-                                format!("— / {}", HumanByte::from(maxmem))
+                                tr!("Configuration unavailable")
                             };
-                            let disk_text = if maxdisk == 0 {
-                                tr!("Not reported")
+                            let disk_text = if let Some(RecoveryGuestConfigState::Ready(summary)) =
+                                config_state
+                            {
+                                if summary.disk_count > 0 {
+                                    format!(
+                                        "{} {} · {} {}",
+                                        HumanByte::from(summary.disk_bytes),
+                                        tr!("provisioned"),
+                                        summary.disk_count,
+                                        if summary.disk_count == 1 {
+                                            tr!("disk")
+                                        } else {
+                                            tr!("disks")
+                                        },
+                                    )
+                                } else {
+                                    tr!("No provisioned disks reported")
+                                }
+                            } else if matches!(
+                                config_state,
+                                Some(RecoveryGuestConfigState::Unavailable)
+                            ) {
+                                tr!("Configuration unavailable")
+                            } else if maxdisk == 0 {
+                                tr!("Loading configuration...")
                             } else if disk > 0 {
                                 format!("{} / {}", HumanByte::from(disk), HumanByte::from(maxdisk))
                             } else {
@@ -4483,7 +4638,7 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                             let uptime_text = if running {
                                 format_duration_human(uptime as f64)
                             } else {
-                                "—".to_string()
+                                tr!("Not running")
                             };
                             html! {
                                 <div class="pdm-recovery-guest-metrics">
@@ -4499,13 +4654,6 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                                 <div><span>{tr!("Inventory")}</span><strong>{tr!("Awaiting fresh guest data")}</strong></div>
                             </div>
                         });
-                    let related_record = if row.key == "source" {
-                        self.failover_records.first()
-                    } else {
-                        self.failover_records
-                            .iter()
-                            .find(|record| record.recovery_vmid == row.vmid)
-                    };
                     let pool_and_tags = row
                         .resource
                         .as_ref()
@@ -4533,10 +4681,15 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                         </>
                     }).unwrap_or_default();
                     html! {
-                        <article key={row.key.clone()} class="pdm-recovery-placement-card">
+                        <article key={row.key.clone()} class={classes!(
+                            "pdm-recovery-placement-card",
+                            authoritative.then_some("pdm-recovery-placement-authoritative"),
+                            retained_target.then_some("pdm-recovery-placement-retained"),
+                            (row.status == tr!("Missing")).then_some("pdm-recovery-placement-error"),
+                        )}>
                             <div class="pdm-recovery-placement-heading">
                                 <span class="pdm-recovery-role">{row.role}</span>
-                                <span class="pdm-recovery-status">{status_icon}{row.status}</span>
+                                <span class={classes!("pdm-recovery-status", power_class)}>{status_icon}{row.status}</span>
                             </div>
                             <div class="pdm-recovery-guest-name" title={row.name.clone()}>
                                 {format!("{} ({})", row.name, row.vmid)}
@@ -4545,7 +4698,11 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                                 <span title={format!("{} / {}", row.remote, row.node)}>
                                     {Fa::new("server")}{format!("{} / {}", row.remote, row.node)}
                                 </span>
-                                <span>{Fa::new("exchange")}{row.lifecycle.clone()}</span>
+                                <span class={classes!(
+                                    "pdm-recovery-lifecycle",
+                                    authoritative.then_some("pdm-recovery-lifecycle-active"),
+                                    retained_target.then_some("pdm-recovery-lifecycle-warning"),
+                                )}>{Fa::new("exchange")}{row.lifecycle.clone()}</span>
                             </div>
                             {guest_metrics}
                             <details class="pdm-recovery-guest-details">
@@ -4986,8 +5143,17 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                 let mut dialog = ConfirmDialog::default().on_confirm({
                     let link = ctx.link().clone();
                     move |_| {
+                        link.change_view(None);
                         link.send_message(Msg::Remove(id.clone().into(), purge_target_snapshots))
                     }
+                })
+                .on_close({
+                    let link = ctx.link().clone();
+                    move |_| link.change_view(None)
+                })
+                .on_dismiss({
+                    let link = ctx.link().clone();
+                    move |_| link.change_view(None)
                 });
                 dialog.set_confirm_message(content);
                 dialog.into()
@@ -4997,7 +5163,18 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                     let snapshot_for_confirm = snapshot.clone();
                     let mut dialog = ConfirmDialog::default().on_confirm({
                         let link = ctx.link().clone();
-                        move |_| link.send_message(Msg::DeleteRecoverySnapshot(snapshot.clone()))
+                        move |_| {
+                            link.change_view(None);
+                            link.send_message(Msg::DeleteRecoverySnapshot(snapshot.clone()))
+                        }
+                    })
+                    .on_close({
+                        let link = ctx.link().clone();
+                        move |_| link.change_view(None)
+                    })
+                    .on_dismiss({
+                        let link = ctx.link().clone();
+                        move |_| link.change_view(None)
                     });
                     dialog.set_confirm_message(format!(
                         "{}\n{}",
@@ -5018,11 +5195,20 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                     let mut dialog = ConfirmDialog::default().dangerous(true).on_confirm({
                         let link = ctx.link().clone();
                         move |_| {
+                            link.change_view(None);
                             link.send_message(Msg::AbandonFailover(
                                 job_id.clone(),
                                 record_id.clone(),
                             ))
                         }
+                    })
+                    .on_close({
+                        let link = ctx.link().clone();
+                        move |_| link.change_view(None)
+                    })
+                    .on_dismiss({
+                        let link = ctx.link().clone();
+                        move |_| link.change_view(None)
                     });
                     dialog.set_confirm_message(format!(
                         "{}\n{}",
@@ -5057,11 +5243,20 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                     let mut dialog = ConfirmDialog::default().dangerous(true).on_confirm({
                         let link = ctx.link().clone();
                         move |_| {
+                            link.change_view(None);
                             link.send_message(Msg::TriggerFailover(
                                 action_for_confirm.job_id.clone(),
                                 action_for_confirm.request.clone(),
                             ))
                         }
+                    })
+                    .on_close({
+                        let link = ctx.link().clone();
+                        move |_| link.change_view(None)
+                    })
+                    .on_dismiss({
+                        let link = ctx.link().clone();
+                        move |_| link.change_view(None)
                     });
                     dialog.set_confirm_message(format!(
                         "{}\n{}\n{}",
@@ -5079,11 +5274,20 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                     let mut dialog = ConfirmDialog::default().dangerous(true).on_confirm({
                         let link = ctx.link().clone();
                         move |_| {
+                            link.change_view(None);
                             link.send_message(Msg::TriggerFailback(
                                 action_for_confirm.job_id.clone(),
                                 action_for_confirm.request.clone(),
                             ))
                         }
+                    })
+                    .on_close({
+                        let link = ctx.link().clone();
+                        move |_| link.change_view(None)
+                    })
+                    .on_dismiss({
+                        let link = ctx.link().clone();
+                        move |_| link.change_view(None)
                     });
                     let mut details = Vec::new();
                     details.push(tr!(
@@ -5909,6 +6113,52 @@ fn resource_guest_metrics(resource: &Resource) -> Option<(f64, f64, u64, u64, u6
     }
 }
 
+fn guest_config_key(remote: &str, vmid: u32) -> String {
+    format!("{remote}:{vmid}")
+}
+
+fn parse_configured_disk_size(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let value = value.strip_suffix('B').unwrap_or(value);
+    let (number, multiplier) = match value.as_bytes().last().copied() {
+        Some(b'K' | b'k') => (&value[..value.len() - 1], 1024_f64),
+        Some(b'M' | b'm') => (&value[..value.len() - 1], 1024_f64.powi(2)),
+        Some(b'G' | b'g') => (&value[..value.len() - 1], 1024_f64.powi(3)),
+        Some(b'T' | b't') => (&value[..value.len() - 1], 1024_f64.powi(4)),
+        Some(b'P' | b'p') => (&value[..value.len() - 1], 1024_f64.powi(5)),
+        _ => (value, 1_f64),
+    };
+    let bytes = number.parse::<f64>().ok()? * multiplier;
+    (bytes.is_finite() && bytes >= 0.0 && bytes <= u64::MAX as f64)
+        .then_some(bytes.round() as u64)
+}
+
+fn summarize_qemu_config(
+    config: &pdm_client::types::QemuConfig,
+) -> RecoveryGuestConfigSummary {
+    let mut summary = RecoveryGuestConfigSummary {
+        disk_bytes: 0,
+        disk_count: 0,
+    };
+    foreach_drive_qemu(config, |_key, drive| {
+        let Ok(drive) = drive else {
+            return;
+        };
+        if drive.is_unused() {
+            return;
+        }
+        let Some(size) = drive.get_size().and_then(parse_configured_disk_size) else {
+            return;
+        };
+        summary.disk_bytes = summary.disk_bytes.saturating_add(size);
+        summary.disk_count += 1;
+    });
+    summary
+}
+
 fn resource_guest_pool_and_tags(resource: &Resource) -> Option<(&str, &[String])> {
     match resource {
         Resource::PveQemu(resource) => Some((resource.pool.as_str(), resource.tags.as_slice())),
@@ -6624,4 +6874,33 @@ fn render_result_trend_graph(
             .serie0(Some(graphs.success.clone()))
             .serie1(Some(graphs.failure.clone())),
     )
+}
+
+#[cfg(test)]
+mod recovery_guest_metric_tests {
+    use super::*;
+
+    #[test]
+    fn parses_configured_disk_sizes() {
+        assert_eq!(parse_configured_disk_size("1G"), Some(1024 * 1024 * 1024));
+        assert_eq!(parse_configured_disk_size("1.5G"), Some(1536 * 1024 * 1024));
+        assert_eq!(parse_configured_disk_size("256M"), Some(256 * 1024 * 1024));
+        assert_eq!(parse_configured_disk_size(""), None);
+    }
+
+    #[test]
+    fn sums_attached_disks_and_excludes_unused_and_cdrom_entries() {
+        let config: pdm_client::types::QemuConfig = serde_json::from_value(serde_json::json!({
+            "digest": "test",
+            "scsi0": "local-zfs:vm-100-disk-0,size=1G",
+            "virtio0": "local-zfs:vm-100-disk-1,size=512M",
+            "ide2": "none,media=cdrom",
+            "unused0": "local-zfs:vm-100-disk-2,size=4G"
+        }))
+        .expect("sample QEMU configuration should parse");
+
+        let summary = summarize_qemu_config(&config);
+        assert_eq!(summary.disk_count, 2);
+        assert_eq!(summary.disk_bytes, 1536 * 1024 * 1024);
+    }
 }

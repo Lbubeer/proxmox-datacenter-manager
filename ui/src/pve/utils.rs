@@ -181,6 +181,22 @@ impl PveDriveQemu {
             | PveDriveQemu::Unused(QemuConfigUnused { file, .. }) => file,
         }
     }
+
+    /// Returns the configured size of the drive, when PVE reports one.
+    pub fn get_size(&self) -> Option<&str> {
+        match self {
+            PveDriveQemu::Sata(QemuConfigSata { size, .. })
+            | PveDriveQemu::Scsi(QemuConfigScsi { size, .. })
+            | PveDriveQemu::Ide(PveQmIde { size, .. })
+            | PveDriveQemu::Virtio(QemuConfigVirtio { size, .. }) => size.as_deref(),
+            PveDriveQemu::Unused(_) => None,
+        }
+    }
+
+    /// Returns whether this entry is detached from the guest.
+    pub fn is_unused(&self) -> bool {
+        matches!(self, PveDriveQemu::Unused(_))
+    }
 }
 
 // note: uses to_value so we can iterate over the keys

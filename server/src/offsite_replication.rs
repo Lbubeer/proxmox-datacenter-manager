@@ -1216,6 +1216,14 @@ fn parse_recovery_stream_line(job_id: &str, line: &str) {
             (Some(done), Some(value)) => Some(done.saturating_add(value)),
             _ => operation.transferred_bytes,
         };
+        if let Some(transferred) = operation.transferred_bytes {
+            operation.estimated_bytes = Some(
+                operation
+                    .estimated_bytes
+                    .unwrap_or_default()
+                    .max(transferred),
+            );
+        }
         operation.bytes_per_second = rate;
         operation.eta_seconds = match (operation.estimated_bytes, operation.transferred_bytes, rate)
         {
@@ -3666,7 +3674,8 @@ fn build_incremental_failback_send_script(
     disk_count: usize,
 ) -> String {
     format!(
-        "origin=$(zfs get -H -o value origin \"$dataset\")\nparent=${{origin%@*}}\nbase=${{origin##*@}}\nrestore_origin() {{\n  if [ \"$(zfs get -H -o value origin \"$parent\")\" != '-' ]; then\n    zfs promote \"$parent\"\n  fi\n}}\nzfs promote \"$dataset\"\ntrap 'restore_origin || true' EXIT\nestimate=$(zfs send -nP -w -i \"$dataset@$base\" \"$dataset@{}\" 2>&1 | awk '/size[[:space:]]/ {{print $2; exit}}')\nestimate=${{estimate:-0}}\nprintf 'PDM_ESTIMATE:{}:{}:%s:%s\\n' \"$estimate\" \"$pdm_completed\" >&2\necho {}\nif command -v cstream >/dev/null 2>&1; then\n  if [ \"$estimate\" -gt 0 ]; then meter_args=(-n \"$estimate\"); else meter_args=(); fi\n  if ! zfs send -w -i \"$dataset@$base\" \"$dataset@{}\" | cstream -v 1 -T 1 \"${{meter_args[@]}}\" 2> >(sed -u \"s/^/PDM_CSTREAM:{}:$pdm_completed:/\" >&2) | ssh -i {} -o BatchMode=yes{} {} -- zfs recv -u -F {}; then\n    restore_origin || true\n    trap - EXIT\n    exit 1\n  fi\nelse\n  zfs send -w -i \"$dataset@$base\" \"$dataset@{}\" | ssh -i {} -o BatchMode=yes{} {} -- zfs recv -u -F {}\nfi\npdm_completed=$((pdm_completed + estimate))\nrestore_origin\ntrap - EXIT\n",
+        "origin=$(zfs get -H -o value origin \"$dataset\")\nparent=${{origin%@*}}\nbase=${{origin##*@}}\nrestore_origin() {{\n  if [ \"$(zfs get -H -o value origin \"$parent\")\" != '-' ]; then\n    zfs promote \"$parent\"\n  fi\n}}\ncleanup_failback_send() {{\n  restore_origin || true\n  zfs destroy \"$dataset@{}\" >/dev/null 2>&1 || true\n}}\nzfs promote \"$dataset\"\ntrap cleanup_failback_send EXIT\nestimate=$(zfs send -nP -w -i \"$dataset@$base\" \"$dataset@{}\" 2>&1 | awk '/size[[:space:]]/ {{print $2; exit}}')\nestimate=${{estimate:-0}}\nprintf 'PDM_ESTIMATE:{}:{}:%s:%s\\n' \"$estimate\" \"$pdm_completed\" >&2\necho {}\nif command -v cstream >/dev/null 2>&1; then\n  zfs send -w -i \"$dataset@$base\" \"$dataset@{}\" | cstream -v 1 -T 1 2> >(sed -u \"s/^/PDM_CSTREAM:{}:$pdm_completed:/\" >&2) | ssh -i {} -o BatchMode=yes{} {} -- zfs recv -u -F {}\nelse\n  zfs send -w -i \"$dataset@$base\" \"$dataset@{}\" | ssh -i {} -o BatchMode=yes{} {} -- zfs recv -u -F {}\nfi\npdm_completed=$((pdm_completed + estimate))\ncleanup_failback_send\ntrap - EXIT\n",
+        snapshot_tag,
         snapshot_tag,
         disk_index,
         disk_count,
@@ -3682,6 +3691,36 @@ fn build_incremental_failback_send_script(
         source_port_args,
         source_ssh,
         shell_escape(staging_dataset),
+    )
+}
+
+fn build_full_failback_send_script(
+    job: &OffsiteReplicationJob,
+    snapshot_tag: &str,
+    staging_dataset: &str,
+    source_port_args: &str,
+    source_ssh: &str,
+    disk_index: usize,
+    disk_count: usize,
+) -> String {
+    format!(
+        "cleanup_failback_send() {{\n  zfs destroy \"$dataset@{snapshot_tag}\" >/dev/null 2>&1 || true\n}}\ntrap cleanup_failback_send EXIT\nestimate=$(zfs send -nP -w \"$dataset@{snapshot_tag}\" 2>&1 | awk '/size[[:space:]]/ {{print $2; exit}}')\nestimate=${{estimate:-0}}\nprintf 'PDM_ESTIMATE:{disk_index}:{disk_count}:%s:%s\\n' \"$estimate\" \"$pdm_completed\" >&2\necho {}\nif command -v cstream >/dev/null 2>&1; then\n  zfs send -w \"$dataset@{snapshot_tag}\" | cstream -v 1 -T 1 2> >(sed -u \"s/^/PDM_CSTREAM:{disk_index}:$pdm_completed:/\" >&2) | ssh -i {} -o BatchMode=yes{} {} -- zfs recv -u -F {}\nelse\n  zfs send -w \"$dataset@{snapshot_tag}\" | ssh -i {} -o BatchMode=yes{} {} -- zfs recv -u -F {}\nfi\npdm_completed=$((pdm_completed + estimate))\ncleanup_failback_send\ntrap - EXIT\n",
+        shell_escape(&format!("full failback staging to {staging_dataset}")),
+        shell_escape(&job.ssh_private_key),
+        source_port_args,
+        source_ssh,
+        shell_escape(staging_dataset),
+        shell_escape(&job.ssh_private_key),
+        source_port_args,
+        source_ssh,
+        shell_escape(staging_dataset),
+    )
+}
+
+fn build_stale_failback_snapshot_cleanup_script(job_id: &str) -> String {
+    let prefix = format!("failback_{}-", sanitize_id(job_id));
+    format!(
+        "while IFS= read -r candidate; do\n  case \"$candidate\" in\n    \"$dataset@{prefix}\"[0-9]*) zfs destroy \"$candidate\" ;;\n  esac\ndone < <(zfs list -H -t snapshot -o name -r \"$dataset\" 2>/dev/null || true)\n"
     )
 }
 
@@ -4010,6 +4049,7 @@ fn execute_failback(
         let staging_dataset = failback_staging_dataset(&destination_dataset, &token)?;
 
         transfer_script.push_str(&zfs_dataset_from_volid_script(&promoted_disk.source_volid));
+        transfer_script.push_str(&build_stale_failback_snapshot_cleanup_script(&job.id));
         transfer_script.push_str(&format!("zfs snapshot \"$dataset@{snapshot_tag}\"\n",));
         if incremental_transfer {
             transfer_script.push_str(&build_incremental_failback_send_script(
@@ -4022,17 +4062,14 @@ fn execute_failback(
                 disk_count,
             ));
         } else {
-            transfer_script.push_str(&format!(
-                "estimate=$(zfs send -nP -w \"$dataset@{snapshot_tag}\" 2>&1 | awk '/size[[:space:]]/ {{print $2; exit}}')\nestimate=${{estimate:-0}}\nprintf 'PDM_ESTIMATE:{disk_index}:{disk_count}:%s:%s\\n' \"$estimate\" \"$pdm_completed\" >&2\necho {}\nif command -v cstream >/dev/null 2>&1; then\n  if [ \"$estimate\" -gt 0 ]; then meter_args=(-n \"$estimate\"); else meter_args=(); fi\n  zfs send -w \"$dataset@{snapshot_tag}\" | cstream -v 1 -T 1 \"${{meter_args[@]}}\" 2> >(sed -u \"s/^/PDM_CSTREAM:{disk_index}:$pdm_completed:/\" >&2) | ssh -i {} -o BatchMode=yes{} {} -- zfs recv -u -F {}\nelse\n  zfs send -w \"$dataset@{snapshot_tag}\" | ssh -i {} -o BatchMode=yes{} {} -- zfs recv -u -F {}\nfi\npdm_completed=$((pdm_completed + estimate))\n",
-                shell_escape(&format!("full failback staging to {staging_dataset}")),
-                shell_escape(&job.ssh_private_key),
-                source_port_args,
-                source_ssh,
-                shell_escape(&staging_dataset),
-                shell_escape(&job.ssh_private_key),
-                source_port_args,
-                source_ssh,
-                shell_escape(&staging_dataset),
+            transfer_script.push_str(&build_full_failback_send_script(
+                job,
+                &snapshot_tag,
+                &staging_dataset,
+                &source_port_args,
+                &source_ssh,
+                disk_index,
+                disk_count,
             ));
         }
     }
@@ -4051,16 +4088,22 @@ fn execute_failback(
             let cleanup_script = build_failback_staging_cleanup_script(
                 job, request, &record, &parsed, &metadata, &token,
             )?;
-            if let Err(cleanup_err) = run_ssh_script_checked(
+            let cleanup_result = run_ssh_script_checked(
                 &job.source_remote,
                 &job.source_node,
                 &job.source_user,
                 &job.ssh_private_key,
                 &cleanup_script,
-            ) {
+            );
+            if let Err(cleanup_err) = cleanup_result {
                 log::warn!("failed to clean failback staging datasets: {cleanup_err}");
+                bail!(
+                    "{err}; failback stopped before source cutover and the active promotion remains retryable; source staging cleanup also failed: {cleanup_err}"
+                );
             }
-            return Err(err);
+            bail!(
+                "{err}; failback stopped before source cutover, source staging was removed, and the active promotion remains retryable"
+            );
         }
     };
     set_recovery_phase(&job.id, "Cutting over source datasets");
@@ -5517,15 +5560,48 @@ mod tests {
             .find("zfs send -w -i \"$dataset@$base\"")
             .expect("normal incremental stream is sent from the promoted dataset");
         let restore_parent = script
-            .rfind("restore_origin")
+            .rfind("cleanup_failback_send\n")
             .expect("original target lineage is restored after sending");
         assert!(promote_recovery < send);
         assert!(send < restore_parent);
-        assert!(script.contains("trap 'restore_origin || true' EXIT"));
         assert!(script.contains("zfs promote \"$parent\""));
         assert!(script.contains("PDM_ESTIMATE:1:1"));
         assert!(script.contains("cstream -v 1 -T 1"));
+        assert!(!script.contains("cstream -v 1 -T 1 -n"));
+        assert!(!script.contains("meter_args"));
         assert!(script.contains("PDM_CSTREAM:1:$pdm_completed"));
+        assert!(script.contains("trap cleanup_failback_send EXIT"));
+        assert!(script.contains("zfs destroy \"$dataset@failback_test\""));
+    }
+
+    #[test]
+    fn test_full_failback_observes_stream_without_limiting_it() {
+        let script = build_full_failback_send_script(
+            &sample_job(GuestType::Qemu),
+            "failback_test",
+            "tank/vmdata/pdm-failback-test-vm-100-disk-0",
+            " -p 22",
+            "root@source.example",
+            1,
+            1,
+        );
+
+        assert!(script.contains("zfs send -nP -w"));
+        assert!(script.contains("cstream -v 1 -T 1"));
+        assert!(!script.contains("cstream -v 1 -T 1 -n"));
+        assert!(!script.contains("meter_args"));
+        assert!(script.contains("trap cleanup_failback_send EXIT"));
+        assert!(script.contains("zfs destroy \"$dataset@failback_test\""));
+    }
+
+    #[test]
+    fn test_failback_retry_cleans_only_job_owned_temporary_snapshots() {
+        let script = build_stale_failback_snapshot_cleanup_script("zfs-plain-910");
+
+        assert!(script.contains("$dataset@failback_zfs-plain-910-"));
+        assert!(script.contains("[0-9]*"));
+        assert!(!script.contains("rep_zfs-plain-910"));
+        assert!(!script.contains("zfs destroy -r"));
     }
 
     #[test]
