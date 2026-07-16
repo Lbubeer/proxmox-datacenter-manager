@@ -3205,9 +3205,23 @@ fn build_source_target_repair_plan(
     combine_repair_plans(dataset_plans)
 }
 
+fn constrain_source_inventory_to_recovery_points(
+    source_inventory: &mut HashMap<String, Vec<ZfsSnapshotInfo>>,
+    recovery_snapshots: &HashMap<String, String>,
+) {
+    for (dataset, snapshots) in source_inventory {
+        let Some(recovery_snapshot) = recovery_snapshots.get(dataset) else {
+            snapshots.clear();
+            continue;
+        };
+        snapshots.retain(|snapshot| snapshot.name == *recovery_snapshot);
+    }
+}
+
 fn source_target_repair_plan_from_bindings(
     job: &OffsiteReplicationJob,
     bindings: &[RepairDatasetBinding],
+    recovery_snapshots: &HashMap<String, String>,
 ) -> Result<ProtectionRepairPlan, Error> {
     let mut source_datasets = Vec::new();
     let mut seen_source = HashSet::new();
@@ -3222,13 +3236,18 @@ fn source_target_repair_plan_from_bindings(
         }
     }
 
-    let source_inventory = list_snapshot_inventory(
+    let mut source_inventory = list_snapshot_inventory(
         &job.source_remote,
         &job.source_node,
         &job.source_user,
         &job.ssh_private_key,
         &source_datasets,
     )?;
+    // Failback replaces the source datasets with the selected recovery point. Newer
+    // snapshots on the current source therefore cannot be used to plan the repair:
+    // they disappear at cutover. Constrain the inventory to the snapshot that will
+    // actually remain so a newer target tail is rolled back before protection sync.
+    constrain_source_inventory_to_recovery_points(&mut source_inventory, recovery_snapshots);
     let target_inventory = list_snapshot_inventory(
         &job.target_remote,
         &job.target_node,
@@ -3253,7 +3272,28 @@ fn source_target_repair_plan(
 ) -> Result<(ProtectionRepairPlan, Vec<RepairDatasetBinding>), Error> {
     match repair_dataset_bindings_from_promotion(job, record, parsed, metadata)? {
         RepairDatasetBindings::Exact(bindings) => {
-            let plan = source_target_repair_plan_from_bindings(job, &bindings)?;
+            let mut recovery_snapshots = HashMap::new();
+            for binding in &bindings {
+                let disk = parsed
+                    .disks
+                    .iter()
+                    .find(|disk| disk.key == binding.disk_key)
+                    .with_context(|| {
+                        format!(
+                            "recovery config is missing disk '{}' required for protection repair",
+                            binding.disk_key
+                        )
+                    })?;
+                recovery_snapshots.insert(
+                    binding.source_dataset.clone(),
+                    source_snapshot_for_disk(record, parsed, metadata, disk)?,
+                );
+            }
+            let plan = source_target_repair_plan_from_bindings(
+                job,
+                &bindings,
+                &recovery_snapshots,
+            )?;
             Ok((plan, bindings))
         }
         RepairDatasetBindings::Unresolved(message) => Ok((
@@ -5680,6 +5720,63 @@ mod tests {
             vec!["tank/offsite/tank__vmdata__vm-100-disk-0@rep_job-100_003".to_string()]
         );
         assert!(plan.retry_supported);
+    }
+
+    #[test]
+    fn test_repair_plan_ignores_source_snapshots_newer_than_recovery_point() {
+        let source_dataset = "tank/vmdata/vm-100-disk-0";
+        let target_dataset = "tank/offsite/tank__vmdata__vm-100-disk-0";
+        let selected = format!("{source_dataset}@rep_job-100_002");
+        let mut source_inventory = HashMap::from([(
+            source_dataset.to_string(),
+            vec![
+                snapshot("tank/vmdata/vm-100-disk-0@rep_job-100_001", "guid-1", &[]),
+                snapshot(&selected, "guid-2", &[]),
+                snapshot("tank/vmdata/vm-100-disk-0@rep_job-100_003", "guid-3", &[]),
+            ],
+        )]);
+        constrain_source_inventory_to_recovery_points(
+            &mut source_inventory,
+            &HashMap::from([(source_dataset.to_string(), selected)]),
+        );
+        let target_inventory = HashMap::from([(
+            target_dataset.to_string(),
+            vec![
+                snapshot(
+                    "tank/offsite/tank__vmdata__vm-100-disk-0@rep_job-100_001",
+                    "guid-1",
+                    &[],
+                ),
+                snapshot(
+                    "tank/offsite/tank__vmdata__vm-100-disk-0@rep_job-100_002",
+                    "guid-2",
+                    &[],
+                ),
+                snapshot(
+                    "tank/offsite/tank__vmdata__vm-100-disk-0@rep_job-100_003",
+                    "guid-3",
+                    &[],
+                ),
+            ],
+        )]);
+        let bindings = vec![RepairDatasetBinding {
+            disk_key: "scsi0".to_string(),
+            source_dataset: source_dataset.to_string(),
+            target_dataset: target_dataset.to_string(),
+        }];
+
+        let plan = build_source_target_repair_plan(
+            "job-100",
+            &bindings,
+            &source_inventory,
+            &target_inventory,
+        );
+
+        assert_eq!(plan.mode, OffsiteFailbackRepairMode::RollbackTail);
+        assert_eq!(
+            plan.rollback_snapshots,
+            vec![format!("{target_dataset}@rep_job-100_003")]
+        );
     }
 
     #[test]
