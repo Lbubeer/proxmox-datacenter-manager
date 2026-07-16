@@ -3382,10 +3382,17 @@ fn reconcile_failover_record(
 
 pub fn list_reconciled_failover_records(
     job: &OffsiteReplicationJob,
+    active_only: bool,
 ) -> Result<Vec<OffsiteFailoverRecord>, Error> {
     let records: Vec<OffsiteFailoverRecord> = list_failover_records(&job.id)?
         .into_iter()
-        .map(|record| reconcile_failover_record(job, record))
+        .map(|record| {
+            if should_reconcile_failover_record(record.lifecycle, active_only) {
+                reconcile_failover_record(job, record)
+            } else {
+                record
+            }
+        })
         .collect();
     if let Some(active) = records.iter().find(|record| {
         record.lifecycle == OffsiteFailoverLifecycle::Active
@@ -3401,6 +3408,13 @@ pub fn list_reconciled_failover_records(
         }
     }
     Ok(records)
+}
+
+fn should_reconcile_failover_record(
+    lifecycle: OffsiteFailoverLifecycle,
+    active_only: bool,
+) -> bool {
+    !active_only || lifecycle == OffsiteFailoverLifecycle::Active
 }
 
 fn failback_precheck_inner(
@@ -5300,6 +5314,26 @@ mod tests {
             Some((1_007_616, 1_007_447)),
         );
         assert_eq!(parse_cstream_stats("not a progress line"), None);
+    }
+
+    #[test]
+    fn test_active_only_reconciliation_skips_historical_records() {
+        assert!(should_reconcile_failover_record(
+            OffsiteFailoverLifecycle::Active,
+            true,
+        ));
+        assert!(!should_reconcile_failover_record(
+            OffsiteFailoverLifecycle::Returned,
+            true,
+        ));
+        assert!(!should_reconcile_failover_record(
+            OffsiteFailoverLifecycle::Abandoned,
+            true,
+        ));
+        assert!(should_reconcile_failover_record(
+            OffsiteFailoverLifecycle::Returned,
+            false,
+        ));
     }
 
     fn sample_job(guest_type: GuestType) -> OffsiteReplicationJob {

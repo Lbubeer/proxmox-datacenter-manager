@@ -313,6 +313,20 @@
     min-width: 0;
 }
 
+.pdm-recovery-placement-loading {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--pwt-spacer-2);
+    min-height: 150px;
+    margin: 0 var(--pwt-spacer-3) var(--pwt-spacer-3);
+    padding: var(--pwt-spacer-3);
+    border: 1px dashed var(--pwt-color-border);
+    border-radius: var(--pwt-button-corner-shape);
+    opacity: 0.8;
+    text-align: center;
+}
+
 .pdm-recovery-placement-card {
     display: flex;
     flex-direction: column;

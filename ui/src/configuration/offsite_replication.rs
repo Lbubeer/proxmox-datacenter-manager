@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -141,20 +141,29 @@ pub enum Msg {
     OpenFailover(Key),
     HistoryLoaded(String, usize, Result<Vec<OffsiteReplicationRun>, Error>),
     RecoveryPointsLoaded(String, Result<Vec<OffsiteRecoveryPoint>, Error>),
-    FailoverRecordsLoaded(String, Result<Vec<OffsiteFailoverRecord>, Error>),
+    FailoverRecoveryPointsLoaded(
+        String,
+        u64,
+        Result<Vec<OffsiteRecoveryPoint>, Error>,
+    ),
+    FailoverRecordsLoaded(String, u64, Result<Vec<OffsiteFailoverRecord>, Error>),
+    FailoverRecordsVerified(String, u64, Result<Vec<OffsiteFailoverRecord>, Error>),
     GuestPlacementLoaded(
         String,
+        u64,
         Result<Vec<RemoteResources>, Error>,
         Result<Option<OffsiteRecoveryOperationStatus>, Error>,
     ),
     GuestPlacementRefreshed(
         String,
+        u64,
         Result<Vec<RemoteResources>, Error>,
         Result<Vec<OffsiteFailoverRecord>, Error>,
         Result<Option<OffsiteRecoveryOperationStatus>, Error>,
     ),
     RecoveryOperationRefreshed(
         String,
+        u64,
         Result<Option<OffsiteRecoveryOperationStatus>, Error>,
     ),
     GuestPlacementRefreshTick,
@@ -286,6 +295,27 @@ fn failover_records_live_state(
         .collect()
 }
 
+fn retain_verified_record_observations(
+    records: &mut [OffsiteFailoverRecord],
+    previous: &[OffsiteFailoverRecord],
+) {
+    for record in records {
+        let Some(verified) = previous.iter().find(|candidate| {
+            candidate.record_id == record.record_id
+                && candidate.lifecycle == record.lifecycle
+                && candidate.last_checked.is_some()
+        }) else {
+            continue;
+        };
+        record.target_guest_state = verified.target_guest_state;
+        record.source_guest_state = verified.source_guest_state;
+        record.current_name = verified.current_name.clone();
+        record.lineage = verified.lineage;
+        record.last_checked = verified.last_checked;
+        record.status_message = verified.status_message.clone();
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Ord, PartialOrd)]
 struct RunModeSummaryRow {
     mode: String,
@@ -317,6 +347,25 @@ struct RunNowFeedback {
     upid: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RecoveryBootstrapState {
+    #[default]
+    Idle,
+    Loading,
+    Stored,
+    Verifying,
+    Verified,
+    Error,
+}
+
+#[derive(Clone)]
+struct CachedRecoveryState {
+    records: Vec<OffsiteFailoverRecord>,
+    resources: Vec<RemoteResources>,
+    operation: Option<OffsiteRecoveryOperationStatus>,
+    verified_at: Option<i64>,
+}
+
 pub struct OffsiteReplicationPanelComp {
     state: LoadableComponentState<ViewState>,
     store: Store<OffsiteReplicationJobStatus>,
@@ -344,6 +393,12 @@ pub struct OffsiteReplicationPanelComp {
     history_rows_choice: String,
     failover_job_id: Option<String>,
     loaded_failover_job_id: Option<String>,
+    recovery_load_generation: u64,
+    recovery_bootstrap_state: RecoveryBootstrapState,
+    recovery_bootstrap_error: Option<String>,
+    recovery_verified_at: Option<i64>,
+    failover_verification_loading: bool,
+    recovery_state_cache: HashMap<String, CachedRecoveryState>,
     recovery_points_loading: bool,
     recovery_points: Vec<OffsiteRecoveryPoint>,
     recovery_store: Store<OffsiteRecoveryPoint>,
@@ -830,10 +885,40 @@ impl OffsiteReplicationPanelComp {
             || self.failback_running
     }
 
-    fn load_guest_placement(&mut self, id: String, ctx: &LoadableComponentContext<Self>) {
-        if self.guest_placement_loading {
+    fn recovery_request_is_current(&self, id: &str, generation: u64) -> bool {
+        self.failover_job_id.as_deref() == Some(id)
+            && self.recovery_load_generation == generation
+    }
+
+    fn cache_current_recovery_state(&mut self) {
+        let Some(id) = self.failover_job_id.clone() else {
+            return;
+        };
+        if !matches!(
+            self.recovery_bootstrap_state,
+            RecoveryBootstrapState::Stored
+                | RecoveryBootstrapState::Verifying
+                | RecoveryBootstrapState::Verified
+        ) {
             return;
         }
+        self.recovery_state_cache.insert(
+            id,
+            CachedRecoveryState {
+                records: self.failover_records.clone(),
+                resources: self.guest_placement_resources.clone(),
+                operation: self.recovery_operation.clone(),
+                verified_at: self.recovery_verified_at,
+            },
+        );
+    }
+
+    fn load_guest_placement(
+        &mut self,
+        id: String,
+        generation: u64,
+        ctx: &LoadableComponentContext<Self>,
+    ) {
         self.guest_placement_loading = true;
         let link = ctx.link().clone();
         ctx.link().spawn(async move {
@@ -852,7 +937,12 @@ impl OffsiteReplicationPanelComp {
                 http_get(&path, None).await
             };
             let (resources, operation) = futures::join!(resources_future, operation_future);
-            link.send_message(Msg::GuestPlacementLoaded(id, resources, operation));
+            link.send_message(Msg::GuestPlacementLoaded(
+                id,
+                generation,
+                resources,
+                operation,
+            ));
         });
     }
 
@@ -862,6 +952,7 @@ impl OffsiteReplicationPanelComp {
         }
         self.guest_placement_loading = true;
         self.failover_records_loading = true;
+        let generation = self.recovery_load_generation;
         let fresh = self.recovery_operation_active();
         let link = ctx.link().clone();
         ctx.link().spawn(async move {
@@ -878,7 +969,13 @@ impl OffsiteReplicationPanelComp {
                     "{BASE_URL}/{}/failover-records",
                     percent_encode_component(&records_id)
                 );
-                http_get(&path, None).await
+                http_get(
+                    &path,
+                    Some(serde_json::json!({
+                        "reconcile": false,
+                    })),
+                )
+                .await
             };
             let operation_future = async move {
                 let path = format!(
@@ -890,12 +987,48 @@ impl OffsiteReplicationPanelComp {
             let (resources, records, operation) =
                 futures::join!(resources_future, records_future, operation_future);
             link.send_message(Msg::GuestPlacementRefreshed(
-                id, resources, records, operation,
+                id,
+                generation,
+                resources,
+                records,
+                operation,
             ));
         });
     }
 
+    fn verify_failover_records(
+        &mut self,
+        id: String,
+        generation: u64,
+        ctx: &LoadableComponentContext<Self>,
+    ) {
+        if !self.recovery_request_is_current(&id, generation)
+            || self.failover_verification_loading
+        {
+            return;
+        }
+        self.failover_verification_loading = true;
+        self.recovery_bootstrap_state = RecoveryBootstrapState::Verifying;
+        let link = ctx.link().clone();
+        ctx.link().spawn(async move {
+            let path = format!(
+                "{BASE_URL}/{}/failover-records",
+                percent_encode_component(&id)
+            );
+            let result = http_get(
+                &path,
+                Some(serde_json::json!({
+                    "reconcile": true,
+                    "active-only": true,
+                })),
+            )
+            .await;
+            link.send_message(Msg::FailoverRecordsVerified(id, generation, result));
+        });
+    }
+
     fn refresh_recovery_operation(&mut self, id: String, ctx: &LoadableComponentContext<Self>) {
+        let generation = self.recovery_load_generation;
         let link = ctx.link().clone();
         ctx.link().spawn(async move {
             let path = format!(
@@ -903,7 +1036,11 @@ impl OffsiteReplicationPanelComp {
                 percent_encode_component(&id)
             );
             let result = http_get(&path, None).await;
-            link.send_message(Msg::RecoveryOperationRefreshed(id, result));
+            link.send_message(Msg::RecoveryOperationRefreshed(
+                id,
+                generation,
+                result,
+            ));
         });
     }
 
@@ -1241,6 +1378,11 @@ impl OffsiteReplicationPanelComp {
             .unwrap_or(false)
         {
             self.failover_job_id = None;
+            self.loaded_failover_job_id = None;
+            self.recovery_load_generation = self.recovery_load_generation.wrapping_add(1);
+            self.recovery_bootstrap_state = RecoveryBootstrapState::Idle;
+            self.recovery_bootstrap_error = None;
+            self.failover_verification_loading = false;
             self.recovery_points.clear();
             self.recovery_store.set_data(Vec::new());
             self.failover_records.clear();
@@ -1473,6 +1615,9 @@ impl OffsiteReplicationPanelComp {
         };
         if let Some(rec) = rec {
             let job_changed = self.loaded_failover_job_id.as_deref() != Some(id.as_str());
+            let cached = self.recovery_state_cache.get(&id).cloned();
+            self.recovery_load_generation = self.recovery_load_generation.wrapping_add(1);
+            let generation = self.recovery_load_generation;
             self.failover_job_id = Some(id.clone());
             self.loaded_failover_job_id = Some(id.clone());
             if job_changed {
@@ -1494,11 +1639,42 @@ impl OffsiteReplicationPanelComp {
                 self.failover_records.clear();
                 self.failover_record_store.set_data(Vec::new());
             }
-            self.recovery_points_loading = true;
-            let load_records = !self.failover_records_loading;
-            if load_records {
-                self.failover_records_loading = true;
+            if let Some(cached) = cached.as_ref() {
+                self.failover_records = cached.records.clone();
+                self.failover_record_store.set_data(cached.records.clone());
+                self.guest_placement_resources = cached.resources.clone();
+                self.recovery_operation = cached.operation.clone();
+                self.recovery_verified_at = cached.verified_at;
+                if let Some(preferred) = cached
+                    .records
+                    .iter()
+                    .find(|record| record.lifecycle == OffsiteFailoverLifecycle::Active)
+                    .or_else(|| cached.records.first())
+                    .map(failover_record_key)
+                {
+                    self.failover_record_selection.select(preferred);
+                }
+                self.rebuild_guest_placement();
             }
+            self.guest_placement_timer = None;
+            self.recovery_bootstrap_state = if cached.is_some() {
+                if self.recovery_verified_at.is_some() {
+                    RecoveryBootstrapState::Verified
+                } else {
+                    RecoveryBootstrapState::Stored
+                }
+            } else if job_changed || self.failover_records.is_empty() {
+                RecoveryBootstrapState::Loading
+            } else {
+                RecoveryBootstrapState::Stored
+            };
+            self.recovery_bootstrap_error = None;
+            if cached.is_none() {
+                self.recovery_verified_at = None;
+            }
+            self.failover_verification_loading = false;
+            self.recovery_points_loading = true;
+            self.failover_records_loading = true;
 
             let recovery_id = id.clone();
             let link = ctx.link().clone();
@@ -1508,23 +1684,35 @@ impl OffsiteReplicationPanelComp {
                     percent_encode_component(&recovery_id)
                 );
                 let points = http_get(&path, None).await;
-                link.send_message(Msg::RecoveryPointsLoaded(recovery_id, points));
+                link.send_message(Msg::FailoverRecoveryPointsLoaded(
+                    recovery_id,
+                    generation,
+                    points,
+                ));
             });
 
-            if load_records {
-                let records_id = id.clone();
-                let link = ctx.link().clone();
-                ctx.link().spawn(async move {
-                    let path = format!(
-                        "{BASE_URL}/{}/failover-records",
-                        percent_encode_component(&records_id)
-                    );
-                    let records = http_get(&path, None).await;
-                    link.send_message(Msg::FailoverRecordsLoaded(records_id, records));
-                });
-            }
+            let records_id = id.clone();
+            let link = ctx.link().clone();
+            ctx.link().spawn(async move {
+                let path = format!(
+                    "{BASE_URL}/{}/failover-records",
+                    percent_encode_component(&records_id)
+                );
+                let records = http_get(
+                    &path,
+                    Some(serde_json::json!({
+                        "reconcile": false,
+                    })),
+                )
+                .await;
+                link.send_message(Msg::FailoverRecordsLoaded(
+                    records_id,
+                    generation,
+                    records,
+                ));
+            });
 
-            self.load_guest_placement(id.clone(), ctx);
+            self.load_guest_placement(id.clone(), generation, ctx);
             self.schedule_guest_placement_refresh(ctx);
         }
     }
@@ -1905,6 +2093,12 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
             history_rows_choice: HISTORY_PAGE_SIZE.to_string(),
             failover_job_id: None,
             loaded_failover_job_id: None,
+            recovery_load_generation: 0,
+            recovery_bootstrap_state: RecoveryBootstrapState::Idle,
+            recovery_bootstrap_error: None,
+            recovery_verified_at: None,
+            failover_verification_loading: false,
+            recovery_state_cache: HashMap::new(),
             recovery_points_loading: false,
             recovery_points: Vec::new(),
             recovery_store: Store::with_extract_key(|item: &OffsiteRecoveryPoint| {
@@ -2405,20 +2599,50 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                     }
                 }
             }
-            Msg::FailoverRecordsLoaded(id, result) => {
-                self.failover_records_loading = false;
-                if self.failover_job_id.as_deref() != Some(id.as_str()) {
-                    if self.current_tab() == TAB_FAILOVER {
-                        if let Some(current_id) = self.failover_job_id.clone() {
-                            self.refresh_guest_placement(current_id, ctx);
-                        }
-                    }
+            Msg::FailoverRecoveryPointsLoaded(id, generation, result) => {
+                if !self.recovery_request_is_current(&id, generation) {
                     return false;
                 }
+                self.recovery_points_loading = false;
+                match result {
+                    Ok(mut points) => {
+                        points.sort_by(|a, b| b.end_time.cmp(&a.end_time));
+                        if !points
+                            .iter()
+                            .any(|point| point.snapshot == self.failover_snapshot_input)
+                        {
+                            self.failover_snapshot_input = points
+                                .first()
+                                .map(|point| point.snapshot.clone())
+                                .unwrap_or_default();
+                        }
+                        if self.recovery_selection.selected_key().is_none() {
+                            if let Some(first) = points.first() {
+                                self.recovery_selection.select(first.snapshot.clone());
+                            }
+                        }
+                        self.recovery_store.set_data(points.clone());
+                        self.recovery_points = points;
+                        self.sync_recovery_view_store();
+                    }
+                    Err(err) => ctx
+                        .link()
+                        .show_error(tr!("Recovery points"), err.to_string(), true),
+                }
+            }
+            Msg::FailoverRecordsLoaded(id, generation, result) => {
+                if !self.recovery_request_is_current(&id, generation) {
+                    return false;
+                }
+                self.failover_records_loading = false;
                 match result {
                     Ok(mut records) => {
                         let previous_live_state =
                             failover_records_live_state(&self.failover_records);
+                        retain_verified_record_observations(
+                            &mut records,
+                            &self.failover_records,
+                        );
                         records.sort_by(|a, b| b.failover_time.cmp(&a.failover_time));
                         let previous_selection = self.failover_record_selection.selected_key();
                         let preferred = records
@@ -2470,23 +2694,62 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                             self.clear_failback_precheck();
                         }
                         self.rebuild_guest_placement();
+                        self.recovery_bootstrap_state = RecoveryBootstrapState::Stored;
+                        self.recovery_bootstrap_error = None;
+                        self.cache_current_recovery_state();
+                        self.verify_failover_records(id, generation, ctx);
                     }
                     Err(err) => {
-                        ctx.link()
-                            .show_error(tr!("Failover records"), err.to_string(), true)
+                        self.recovery_bootstrap_state = RecoveryBootstrapState::Error;
+                        self.recovery_bootstrap_error = Some(err.to_string());
                     }
                 }
             }
-            Msg::GuestPlacementLoaded(id, result, operation_result) => {
-                self.guest_placement_loading = false;
-                if self.failover_job_id.as_deref() != Some(id.as_str()) {
-                    if self.current_tab() == TAB_FAILOVER {
-                        if let Some(current_id) = self.failover_job_id.clone() {
-                            self.load_guest_placement(current_id, ctx);
-                        }
-                    }
+            Msg::FailoverRecordsVerified(id, generation, result) => {
+                if !self.recovery_request_is_current(&id, generation) {
                     return false;
                 }
+                self.failover_verification_loading = false;
+                match result {
+                    Ok(records) => {
+                        for verified in records {
+                            if verified.last_checked.is_none() {
+                                continue;
+                            }
+                            if let Some(current) = self.failover_records.iter_mut().find(|record| {
+                                record.record_id == verified.record_id
+                                    && record.lifecycle == verified.lifecycle
+                            }) {
+                                current.target_guest_state = verified.target_guest_state;
+                                current.source_guest_state = verified.source_guest_state;
+                                current.current_name = verified.current_name;
+                                current.lineage = verified.lineage;
+                                current.last_checked = verified.last_checked;
+                                current.status_message = verified.status_message;
+                            }
+                        }
+                        self.failover_record_store
+                            .set_data(self.failover_records.clone());
+                        self.recovery_bootstrap_state = RecoveryBootstrapState::Verified;
+                        self.recovery_verified_at = Some(proxmox_time::epoch_i64());
+                        self.recovery_bootstrap_error = None;
+                        self.rebuild_guest_placement();
+                        self.cache_current_recovery_state();
+                    }
+                    Err(err) => {
+                        self.recovery_bootstrap_state = RecoveryBootstrapState::Stored;
+                        self.recovery_bootstrap_error = Some(format!(
+                            "{}: {err}",
+                            tr!("Live verification failed")
+                        ));
+                    }
+                }
+            }
+            Msg::GuestPlacementLoaded(id, generation, result, operation_result) => {
+                if !self.recovery_request_is_current(&id, generation) {
+                    return false;
+                }
+                self.guest_placement_loading = false;
                 let previous = self.guest_placement_live_state();
                 self.guest_placement_resources = result.unwrap_or_default();
                 if let Ok(operation) = operation_result {
@@ -2502,6 +2765,7 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                     }
                 }
                 self.rebuild_guest_placement();
+                self.cache_current_recovery_state();
                 if previous != self.guest_placement_live_state() && !previous.is_empty() {
                     self.clear_failback_precheck();
                 }
@@ -2509,25 +2773,22 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
             }
             Msg::GuestPlacementRefreshed(
                 id,
+                generation,
                 resources_result,
                 records_result,
                 operation_result,
             ) => {
-                self.guest_placement_loading = false;
-                self.failover_records_loading = false;
-                if self.failover_job_id.as_deref() != Some(id.as_str()) {
-                    if self.current_tab() == TAB_FAILOVER {
-                        if let Some(current_id) = self.failover_job_id.clone() {
-                            self.refresh_guest_placement(current_id, ctx);
-                        }
-                    }
+                if !self.recovery_request_is_current(&id, generation) {
                     return false;
                 }
+                self.guest_placement_loading = false;
+                self.failover_records_loading = false;
 
                 let previous_rows = self.guest_placement_live_state();
                 let previous_records = failover_records_live_state(&self.failover_records);
                 self.guest_placement_resources = resources_result.unwrap_or_default();
                 if let Ok(mut records) = records_result {
+                    retain_verified_record_observations(&mut records, &self.failover_records);
                     records.sort_by(|a, b| b.failover_time.cmp(&a.failover_time));
                     self.failover_record_store.set_data(records.clone());
                     self.failover_records = records;
@@ -2578,16 +2839,29 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                         }
                     }
                 }
-                if previous_records != failover_records_live_state(&self.failover_records)
+                let records_changed =
+                    previous_records != failover_records_live_state(&self.failover_records);
+                if records_changed
                     || (!previous_rows.is_empty()
                         && previous_rows != self.guest_placement_live_state())
                 {
                     self.clear_failback_precheck();
                 }
+                if records_changed {
+                    self.recovery_verified_at = None;
+                }
+                let verification_due = self
+                    .recovery_verified_at
+                    .map(|checked| proxmox_time::epoch_i64().saturating_sub(checked) >= 30)
+                    .unwrap_or(true);
+                if verification_due && !self.failover_verification_loading {
+                    self.verify_failover_records(id, generation, ctx);
+                }
+                self.cache_current_recovery_state();
                 self.schedule_guest_placement_refresh(ctx);
             }
-            Msg::RecoveryOperationRefreshed(id, result) => {
-                if self.failover_job_id.as_deref() != Some(id.as_str()) {
+            Msg::RecoveryOperationRefreshed(id, generation, result) => {
+                if !self.recovery_request_is_current(&id, generation) {
                     return false;
                 }
                 if let Ok(operation) = result {
@@ -2604,6 +2878,7 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                     self.failback_running = false;
                 }
                 self.rebuild_guest_placement();
+                self.cache_current_recovery_state();
                 if self.recovery_operation.as_ref().is_some_and(|operation| {
                     operation.state == OffsiteRecoveryOperationState::Reconciling
                 }) {
@@ -2655,6 +2930,8 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                     }
                 };
 
+                self.recovery_load_generation = self.recovery_load_generation.wrapping_add(1);
+                self.failover_verification_loading = false;
                 self.failover_running = true;
                 let link = ctx.link().clone();
                 ctx.link().spawn(async move {
@@ -2736,6 +3013,8 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                     }
                 };
 
+                self.recovery_load_generation = self.recovery_load_generation.wrapping_add(1);
+                self.failover_verification_loading = false;
                 self.failback_running = true;
                 let link = ctx.link().clone();
                 ctx.link().spawn(async move {
@@ -3604,6 +3883,18 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
             .clone()
             .or_else(|| self.default_job_id())
         {
+            let recovery_records_ready = matches!(
+                self.recovery_bootstrap_state,
+                RecoveryBootstrapState::Stored
+                    | RecoveryBootstrapState::Verifying
+                    | RecoveryBootstrapState::Verified
+            );
+            let recovery_records_loading = matches!(
+                self.recovery_bootstrap_state,
+                RecoveryBootstrapState::Idle | RecoveryBootstrapState::Loading
+            );
+            let recovery_records_error =
+                self.recovery_bootstrap_state == RecoveryBootstrapState::Error;
             let recovery_snapshot_items: Rc<Vec<yew::AttrValue>> = Rc::new(
                 self.recovery_points
                     .iter()
@@ -3659,16 +3950,32 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                 .failover_records
                 .first()
                 .filter(|record| record.lifecycle == OffsiteFailoverLifecycle::Returned);
-            let attention_required = source_and_target_running
+            let attention_required = recovery_records_ready
+                && (source_and_target_running
                 || (source_guest_missing && !has_active_promotion)
                 || active_guest_missing
-                || active_records.len() > 1;
+                || active_records.len() > 1);
             let active_recovery_operation = self
                 .recovery_operation
                 .as_ref()
                 .filter(|operation| operation.state.is_active());
-            let (workflow_stage, workflow_icon, workflow_class, next_action) = if attention_required
-            {
+            let (workflow_stage, workflow_icon, workflow_class, next_action) = if recovery_records_loading {
+                (
+                    tr!("Loading Recovery State"),
+                    "spinner",
+                    ColorScheme::Primary,
+                    tr!("Reading the persisted recovery lifecycle before enabling any recovery action."),
+                )
+            } else if recovery_records_error {
+                (
+                    tr!("Recovery State Unavailable"),
+                    "exclamation-triangle",
+                    ColorScheme::Error,
+                    self.recovery_bootstrap_error.clone().unwrap_or_else(|| {
+                        tr!("The persisted recovery lifecycle could not be loaded. Refresh before continuing.")
+                    }),
+                )
+            } else if attention_required {
                 (
                     tr!("Attention Required"),
                     "exclamation-triangle",
@@ -4166,7 +4473,9 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                             } else {
                                 format!("— / {}", HumanByte::from(maxmem))
                             };
-                            let disk_text = if disk > 0 {
+                            let disk_text = if maxdisk == 0 {
+                                tr!("Not reported")
+                            } else if disk > 0 {
                                 format!("{} / {}", HumanByte::from(disk), HumanByte::from(maxdisk))
                             } else {
                                 format!("{} {}", HumanByte::from(maxdisk), tr!("capacity"))
@@ -4255,6 +4564,20 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                     }
                 })
                 .collect::<Vec<_>>();
+            let placement_content = if recovery_records_ready {
+                html! {<div class="pdm-recovery-placement-grid">{placement_cards}</div>}
+            } else {
+                html! {
+                    <div class="pdm-recovery-placement-loading">
+                        {Fa::new(if recovery_records_error { "exclamation-triangle" } else { "spinner" })}
+                        <span>{if recovery_records_error {
+                            tr!("Recovery placement is unavailable until the persisted lifecycle reloads.")
+                        } else {
+                            tr!("Loading authoritative source and promoted-target placement...")
+                        }}</span>
+                    </div>
+                }
+            };
             let selected_point_summary = selected_protection_point
                 .map(|point| {
                     format!(
@@ -4281,6 +4604,34 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                 .first()
                 .map(|record| failover_lifecycle_text(record.lifecycle))
                 .unwrap_or_else(|| tr!("None"));
+            let verification_summary = match self.recovery_bootstrap_state {
+                RecoveryBootstrapState::Idle | RecoveryBootstrapState::Loading => {
+                    tr!("Loading recovery state")
+                }
+                RecoveryBootstrapState::Stored => self
+                    .recovery_bootstrap_error
+                    .clone()
+                    .unwrap_or_else(|| tr!("Stored state loaded")),
+                RecoveryBootstrapState::Verifying => tr!("Verifying live state"),
+                RecoveryBootstrapState::Verified => self
+                    .recovery_verified_at
+                    .map(|checked| format!("{} {}", tr!("Verified"), render_epoch_short(checked)))
+                    .unwrap_or_else(|| tr!("Live state verified")),
+                RecoveryBootstrapState::Error => tr!("Recovery state unavailable"),
+            };
+            let promotion_summary = if recovery_records_ready {
+                format!(
+                    "{}: {} · {}: {active_record_count} · {}: {latest_lifecycle}",
+                    tr!("Records"),
+                    self.failover_records.len(),
+                    tr!("Active"),
+                    tr!("Latest"),
+                )
+            } else if recovery_records_error {
+                tr!("Promotion records unavailable")
+            } else {
+                tr!("Loading promotion records...")
+            };
 
             Container::new()
                 .class(pwt::css::FlexFit)
@@ -4351,6 +4702,7 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                                             <span title={selected_point_summary.clone()}>{Fa::new("clock-o")}{selected_point_summary.clone()}</span>
                                             <span>{Fa::new("refresh")}{selected_job.as_ref().map(status_text).unwrap_or_else(|| tr!("Unknown"))}</span>
                                             <span>{Fa::new(if selected_job_suspended { "pause" } else { "play" })}{if selected_job_suspended { tr!("Replication suspended") } else { tr!("Replication active") }}</span>
+                                            <span>{Fa::new(if self.recovery_bootstrap_state == RecoveryBootstrapState::Verified { "check-circle" } else { "refresh" })}{verification_summary}</span>
                                         </div>
                                     </div>
                                 })
@@ -4360,7 +4712,7 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                                         {tr!("Split-brain warning: source and promoted guests are both reported as running.")}
                                     </div>
                                 }))
-                                .with_optional_child((source_guest_missing && !has_active_promotion).then(|| html! {
+                                .with_optional_child((recovery_records_ready && source_guest_missing && !has_active_promotion).then(|| html! {
                                     <div class="pdm-recovery-alert pwt-color-warning">
                                         {tr!("Source guest is missing. Confirm the source outage before promoting the replica.")}
                                     </div>
@@ -4373,6 +4725,11 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                                 .with_optional_child((active_record_count > 1).then(|| html! {
                                     <div class="pdm-recovery-alert pwt-color-warning">
                                         {tr!("Multiple active promotion records require an operator selection.")}
+                                    </div>
+                                }))
+                                .with_optional_child((recovery_records_ready && self.recovery_bootstrap_error.is_some()).then(|| html! {
+                                    <div class="pdm-recovery-alert pwt-color-warning">
+                                        {self.recovery_bootstrap_error.clone().unwrap_or_default()}
                                     </div>
                                 })),
                         )
@@ -4399,11 +4756,11 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                                                 }),
                                         ),
                                 )
-                                .with_child(html! {<div class="pdm-recovery-placement-grid">{placement_cards}</div>}),
+                                .with_child(placement_content),
                         )
                         .with_child(html! {
                             <section class="pdm-recovery-primary-action">
-                                {if active_recovery_operation.is_some() {
+                                {if !recovery_records_ready || active_recovery_operation.is_some() {
                                     html! {}
                                 } else if has_active_promotion {
                                     failback_panel
@@ -4458,7 +4815,7 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                                 .title(tr!("Promotion History"))
                                 .with_child(
                                     Toolbar::new()
-                                        .with_child(html! {<span class="pdm-recovery-summary">{format!("{}: {}", tr!("Records"), self.failover_records.len())}{" · "}{format!("{}: {active_record_count}", tr!("Active"))}{" · "}{format!("{}: {latest_lifecycle}", tr!("Latest"))}</span>})
+                                        .with_child(html! {<span class="pdm-recovery-summary">{promotion_summary}</span>})
                                         .with_flex_spacer()
                                         .with_child(
                                             Button::new(if self.promotion_history_expanded { tr!("Collapse") } else { tr!("Expand") })
@@ -4484,8 +4841,8 @@ impl LoadableComponent for OffsiteReplicationPanelComp {
                                 )
                                 .with_optional_child(self.recovery_more_actions_expanded.then(|| html! {
                                     <div class="pdm-recovery-more-actions">
-                                        {Button::new(tr!("Archive / Abandon")).icon_class("fa fa-archive").disabled(!selected_record_active || self.failback_running).on_activate(ctx.link().callback(|_| Msg::RequestAbandonFailover))}
-                                        {Button::new(tr!("Resume Replication")).icon_class("fa fa-play").disabled(!selected_job_suspended).on_activate(ctx.link().callback(|_| Msg::ResumeReplication))}
+                                        {Button::new(tr!("Archive / Abandon")).icon_class("fa fa-archive").disabled(!recovery_records_ready || !selected_record_active || self.failback_running).on_activate(ctx.link().callback(|_| Msg::RequestAbandonFailover))}
+                                        {Button::new(tr!("Resume Replication")).icon_class("fa fa-play").disabled(!recovery_records_ready || !selected_job_suspended).on_activate(ctx.link().callback(|_| Msg::ResumeReplication))}
                                         {Button::new(tr!("Delete Snapshot")).icon_class("fa fa-trash").disabled(self.recovery_delete_running || self.recovery_points_loading || self.recovery_points.is_empty() || self.recovery_selection.is_empty()).on_activate(ctx.link().callback(|_| Msg::OpenDeleteRecoverySnapshot))}
                                     </div>
                                 })),

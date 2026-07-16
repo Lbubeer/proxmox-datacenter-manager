@@ -601,6 +601,18 @@ fn delete_recovery_snapshot(
         description: "List recorded failovers for an off-site replication job.",
         properties: {
             id: { schema: OFFSITE_REPLICATION_ID_SCHEMA },
+            reconcile: {
+                type: bool,
+                optional: true,
+                default: true,
+                description: "Verify guest state and lineage over SSH before returning records.",
+            },
+            "active-only": {
+                type: bool,
+                optional: true,
+                default: false,
+                description: "When reconciling, verify only active promotion records.",
+            },
         },
     },
     access: {
@@ -615,6 +627,8 @@ fn delete_recovery_snapshot(
 /// List failover records available for failback.
 fn list_failover_records(
     id: String,
+    reconcile: bool,
+    active_only: bool,
     rpcenv: &mut dyn RpcEnvironment,
 ) -> Result<Vec<OffsiteFailoverRecord>, Error> {
     let (config, _) = pdm_config::offsite_replication::config()?;
@@ -625,7 +639,11 @@ fn list_failover_records(
     check_source_guest_privs(rpcenv, job, PRIV_RESOURCE_AUDIT)?;
     check_target_remote_privs(rpcenv, &job.target_remote, PRIV_RESOURCE_AUDIT)?;
 
-    crate::offsite_replication::list_reconciled_failover_records(job)
+    if reconcile {
+        crate::offsite_replication::list_reconciled_failover_records(job, active_only)
+    } else {
+        crate::offsite_replication::list_failover_records(&id)
+    }
 }
 
 #[api(
